@@ -11,15 +11,8 @@
 #ifndef NNG_SUPPLEMENTAL_HTTP_HTTP_H
 #define NNG_SUPPLEMENTAL_HTTP_HTTP_H
 
-// nni_http_request represents an HTTP request.
-typedef struct nni_http_req nni_http_req;
-
-// nni_http_response represents an HTTP response.
-typedef struct nni_http_res nni_http_res;
-
-typedef struct nni_http_cli_conn nni_http_cli_conn;
-
-typedef struct nni_http_srv_conn nni_http_srv_conn;
+// nni_http_msg represents an HTTP request or response message.
+typedef struct nni_http_msg nni_http_msg;
 
 typedef struct nni_http_tran {
 	void *h_data;
@@ -28,35 +21,28 @@ typedef struct nni_http_tran {
 	void (*h_close)(void *);
 } nni_http_tran;
 
-// nni_http_req_init initializes an HTTP request.  By default this will be
-// initialized for GET / HTTP/1.1.  HTTP/2 is explicitly not supported at
-// this time.
-extern int         nni_http_req_init(nni_http_req **);
-extern void        nni_http_req_free(nni_http_req *);
-extern int         nni_http_req_set_method(nni_http_req *, const char *);
-extern const char *nni_http_req_get_method(nni_http_req *);
-extern int         nni_http_req_set_version(nni_http_req *, const char *);
-extern const char *nni_http_req_get_version(nni_http_req *);
-extern const char *nni_http_req_get_uri(nni_http_req *);
-extern int         nni_http_req_set_uri(nni_http_req *, const char *);
-extern const char *nni_http_req_get_value(nni_http_req *, const char *);
-extern int  nni_http_req_set_value(nni_http_req *, const char *, const char *);
-extern void nni_http_req_set_content(nni_http_req *, const void *, size_t);
-extern int  nni_http_req_copy_content(nni_http_req *, const void *, size_t);
-extern void nni_http_req_get_content(nni_http_req *, void **, size_t *);
+// nni_http_msg_init initializes an HTTP request.
+extern int         nni_http_msg_init_req(nni_http_msg **);
+extern int         nni_http_msg_init_res(nni_http_msg **);
+extern void        nni_http_msg_free(nni_http_msg *);
+extern int         nni_http_msg_set_method(nni_http_msg *, const char *);
+extern const char *nni_http_msg_get_method(nni_http_msg *);
+extern int         nni_http_msg_set_version(nni_http_msg *, const char *);
+extern const char *nni_http_msg_get_version(nni_http_msg *);
+extern const char *nni_http_msg_get_uri(nni_http_msg *);
+extern int         nni_http_msg_set_uri(nni_http_msg *, const char *);
+extern const char *nni_http_msg_get_header(nni_http_msg *, const char *);
+extern int         nni_http_msg_del_header(nni_http_msg *, const char *);
+extern int         nni_http_msg_set_status(nni_http_msg *, int, const char *);
+extern int         nni_http_msg_get_status(nni_http_msg *);
+extern const char *nni_http_msg_get_reason(nni_http_msg *);
 
-extern int         nni_http_res_init(nni_http_res **);
-extern void        nni_http_res_fini(nni_http_res *);
-extern int         nni_http_res_set_status(nni_http_res *, int, const char *);
-extern int         nni_http_res_get_status(nni_http_res *);
-extern const char *nni_http_res_get_message(nni_http_res *);
-extern void nni_http_res_set_content(nni_http_res *, const void *, size_t);
-extern int  nni_http_res_copy_content(nni_http_res *, const void *, size_t);
-extern int  nni_http_res_get_content(nni_http_res *, void **, size_t *);
-extern const char *nni_http_res_get_value(nni_http_res *, const char *);
-extern int nni_http_res_set_value(nni_http_res *, const char *, const char *);
-
-extern int nni_http_conn_init(nni_http_conn **, nni_http_tran *);
+extern int nni_http_msg_set_header(nni_http_msg *, const char *, const char *);
+extern int nni_http_msg_set_data(nni_http_msg *, const void *, size_t);
+extern int nni_http_msg_copy_data(nni_http_msg *, const void *, size_t);
+extern void nni_http_msg_get_content(nni_http_msg *, void **, size_t *);
+extern int  nni_http_msg_parse(nni_http_msg *, char *, size_t, size_t *);
+extern int  nni_http_msg_parse_data(nni_http_msg *, char *, size_t, size_t *);
 
 // HTTP status codes.  This list is not exhaustive.
 enum { NNI_HTTP_STATUS_CONTINUE                  = 100,

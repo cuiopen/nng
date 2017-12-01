@@ -120,6 +120,7 @@ if (NNG_PLATFORM_WINDOWS)
 endif()
 
 add_subdirectory(supplemental/base64)
+add_subdirectory(supplemental/http)
 add_subdirectory(supplemental/mbedtls)
 
 add_subdirectory(protocol/bus0)
