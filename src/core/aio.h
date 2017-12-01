@@ -36,7 +36,6 @@ struct nni_aio {
 	unsigned a_waiting : 1;  // a thread is waiting for this to finish
 	unsigned a_synch : 1;    // run completion synchronously
 	unsigned a_reltime : 1;  // expiration time is relative
-	unsigned a_pad : 25;     // ensure 32-bit alignment
 	nni_task a_task;
 
 	// Read/write operations.
@@ -60,6 +59,7 @@ struct nni_aio {
 	nni_aio_cancelfn a_prov_cancel;
 	void *           a_prov_data;
 	nni_list_node    a_prov_node;
+	void *           a_prov_extra; // Extra data used by provider
 
 	// Expire node.
 	nni_list_node a_expire_node;
