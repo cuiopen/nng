@@ -302,6 +302,19 @@ http_msg_prepare(nni_http_msg *m)
 	return (0);
 }
 
+int
+nni_http_msg_get_buf(nni_http_msg *msg, void **data, size_t *szp)
+{
+	int rv;
+
+	if ((msg->buf == NULL) && (rv = http_msg_prepare(msg)) != 0) {
+		return (rv);
+	}
+	*data = msg->buf;
+	*szp  = msg->bufsz;
+	return (0);
+}
+
 // parse the request.  Note that this is destructive to the line.
 static int
 http_msg_parse_req(nni_http_msg *msg, char *line)
