@@ -8,5 +8,5 @@
 # found online at https://opensource.org/licenses/MIT.
 #
 
-set(HTTP_SOURCES supplemental/http/http_msg.c supplemental/http/http.h)
+set(HTTP_SOURCES supplemental/http/http_msg.c supplemental/http/http.c supplemental/http/http.h)
 set(NNG_SOURCES ${NNG_SOURCES} ${HTTP_SOURCES} PARENT_SCOPE)

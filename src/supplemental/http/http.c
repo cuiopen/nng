@@ -33,7 +33,7 @@ typedef enum {
 	HTTP_MODE_SERVER = 2,
 } http_conn_mode;
 
-struct nni_http_conn {
+struct nni_http {
 	void *sock;
 	void (*rd)(void *, nni_aio *);
 	void (*wr)(void *, nni_aio *);
@@ -139,21 +139,21 @@ http_close(nni_http *http)
 
 	http->closed = true;
 	if (nni_list_first(&http->wrq)) {
-		nni_aio_cancel(&http->wr_aio);
+		nni_aio_cancel(http->wr_aio, NNG_ECLOSED);
 		while ((aio = nni_list_first(&http->wrq)) != NULL) {
 			nni_aio_list_remove(aio);
 			nni_aio_finish_error(aio, NNG_ECLOSED);
 		}
 	}
 	if (nni_list_first(&http->rdq)) {
-		nni_aio_cancel(&http->rd_aio);
+		nni_aio_cancel(http->rd_aio, NNG_ECLOSED);
 		while ((aio = nni_list_first(&http->rdq)) != NULL) {
 			nni_aio_list_remove(aio);
 			nni_aio_finish_error(aio, NNG_ECLOSED);
 		}
 	}
 
-	conn->close(conn->sock);
+	http->close(http->sock);
 }
 
 #if 0
@@ -368,7 +368,12 @@ nni_http_conn_cancel(nni_aio *aio, int rv)
 }
 #endif
 
-int static void
+static void
+http_rd_cb(void *arg)
+{
+}
+
+static void
 http_wr_start(nni_http *http)
 {
 	nni_aio *aio;
@@ -395,9 +400,10 @@ static void
 http_wr_cb(void *arg)
 {
 	nni_http *http = arg;
-	nni_aio * aio  = conn->wr_aio;
+	nni_aio * aio  = http->wr_aio;
 	nni_aio * uaio;
 	int       rv;
+	size_t    n;
 
 	nni_mtx_lock(&http->mtx);
 
@@ -410,7 +416,7 @@ http_wr_cb(void *arg)
 			nni_aio_finish_error(uaio, rv);
 		}
 		http_close(http);
-		nni_mtx_unlock(&conn->mtx);
+		nni_mtx_unlock(&http->mtx);
 		return;
 	}
 
@@ -431,8 +437,8 @@ http_wr_cb(void *arg)
 	}
 	if ((aio->a_niov != 0) && (aio->a_iov[0].iov_len != 0)) {
 		// We have more to transmit.
-		conn->wr(conn->sock, aio);
-		nni_mtx_unlock(&conn->mtx);
+		http->wr(http->sock, aio);
+		nni_mtx_unlock(&http->mtx);
 		return;
 	}
 
@@ -442,7 +448,7 @@ http_wr_cb(void *arg)
 	// Start next write if another is ready.
 	http_wr_start(http);
 
-	nni_mtx_unlock(&conn->mtx);
+	nni_mtx_unlock(&http->mtx);
 }
 
 static void
@@ -469,7 +475,7 @@ http_wr_submit(nni_http *http, nni_aio *aio)
 		return;
 	}
 	if (http->closed) {
-		nni_aio_finish(aio, NNG_ECLOSED);
+		nni_aio_finish_error(aio, NNG_ECLOSED);
 		return;
 	}
 	nni_list_append(&http->wrq, aio);
@@ -486,7 +492,7 @@ nni_http_write_msg(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 	size_t bufsz;
 
 	if ((rv = nni_http_msg_get_buf(msg, &buf, &bufsz)) != 0) {
-		nni_aio_finish(aio, rv);
+		nni_aio_finish_error(aio, rv);
 		return;
 	}
 	aio->a_niov           = 1;
@@ -508,10 +514,10 @@ nni_http_write_msg_data(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 	size_t datasz;
 
 	if ((rv = nni_http_msg_get_buf(msg, &buf, &bufsz)) != 0) {
-		nni_aio_finish(aio, rv);
+		nni_aio_finish_error(aio, rv);
 		return;
 	}
-	http_msg_get_data(msg, &data, &datasz);
+	nni_http_msg_get_data(msg, &data, &datasz);
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;
@@ -531,10 +537,10 @@ nni_http_write_data(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 	void * data;
 	size_t datasz;
 
-	http_msg_get_data(msg, &data, &datasz);
+	nni_http_msg_get_data(msg, &data, &datasz);
 	aio->a_niov           = 1;
-	aio->a_iov[0].iov_len = bufsz;
-	aio->a_iov[0].iov_buf = buf;
+	aio->a_iov[0].iov_len = datasz;
+	aio->a_iov[0].iov_buf = data;
 	nni_mtx_lock(&http->mtx);
 	http_wr_submit(http, aio);
 	nni_mtx_unlock(&http->mtx);
@@ -547,11 +553,9 @@ nni_http_write_data(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 void
 nni_http_write(nni_http *http, nni_aio *aio)
 {
-	nni_http *http = arg;
-
-	nni_mtx_lock(&conn->mtx);
+	nni_mtx_lock(&http->mtx);
 	http_wr_submit(http, aio);
-	nni_mtx_unlock(&conn->mtx);
+	nni_mtx_unlock(&http->mtx);
 }
 
 void
@@ -560,10 +564,10 @@ nni_http_fini(nni_http *http)
 	nni_mtx_lock(&http->mtx);
 	http_close(http);
 	nni_mtx_unlock(&http->mtx);
-	nni_aio_stop(&http->wr_aio);
-	nni_aio_stop(&http->rd_aio);
-	nni_aio_fini(&http->wr_aio);
-	nni_aio_fini(&http->rd_aio);
+	nni_aio_stop(http->wr_aio);
+	nni_aio_stop(http->rd_aio);
+	nni_aio_fini(http->wr_aio);
+	nni_aio_fini(http->rd_aio);
 	nni_mtx_fini(&http->mtx);
 	NNI_FREE_STRUCT(http);
 }
@@ -574,7 +578,7 @@ nni_http_init(nni_http **httpp, nni_http_tran *tran)
 	nni_http *http;
 	int       rv;
 
-	if ((http == NNI_ALLOC_STRUCT(http)) == NULL) {
+	if ((http = NNI_ALLOC_STRUCT(http)) == NULL) {
 		return (NNG_ENOMEM);
 	}
 	nni_mtx_init(&http->mtx);
