@@ -584,7 +584,7 @@ http_msg_parse(nni_http_msg *msg, char *buf, size_t n, size_t *lenp, bool dat)
 		n -= cnt;
 
 		// If that is the end of the headers, then start scanning
-		// for data, if the caller asked us to, and are an HTTP/1.1
+		// for data, if the caller asked us to, and it's an HTTP/1.1
 		// request.
 		if (*line == '\0') {
 			const char *cls;
