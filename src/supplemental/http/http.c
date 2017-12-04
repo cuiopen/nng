@@ -369,6 +369,29 @@ nni_http_conn_cancel(nni_aio *aio, int rv)
 #endif
 
 static void
+http_rd_start(nni_http *http)
+{
+	nni_aio *aio;
+
+	if (http->closed) {
+		while ((aio = nni_list_first(&http->rdq)) != NULL) {
+			nni_aio_list_remove(aio);
+			nni_aio_finish_error(aio, NNG_ECLOSED);
+		}
+		return;
+	}
+
+	if ((aio = nni_list_first(&http->rdq)) != NULL) {
+		http->rd_aio->a_niov = aio->a_niov;
+		for (int i = 0; i < aio->a_niov; i++) {
+			http->rd_aio->a_iov[i] = aio->a_iov[i];
+		}
+		// Submit it down for completion.
+		http->rd(http->sock, http->rd_aio);
+	}
+}
+
+static void
 http_rd_cb(void *arg)
 {
 }
@@ -422,6 +445,11 @@ http_wr_cb(void *arg)
 
 	n = nni_aio_count(aio);
 	uaio->a_count += n;
+	if (uaio->a_prov_data == NULL) {
+		// For raw data, we just send partial completion notices to
+		// the consumer.
+		goto done;
+	}
 	while (n) {
 		NNI_ASSERT(aio->a_niov != 0);
 		if (aio->a_iov[0].iov_len > n) {
@@ -442,6 +470,7 @@ http_wr_cb(void *arg)
 		return;
 	}
 
+done:
 	nni_aio_list_remove(uaio);
 	nni_aio_finish(uaio, 0, uaio->a_count);
 
@@ -495,6 +524,7 @@ nni_http_write_msg(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
+	aio->a_prov_extra     = msg;
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;
@@ -518,6 +548,7 @@ nni_http_write_msg_data(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 		return;
 	}
 	nni_http_msg_get_data(msg, &data, &datasz);
+	aio->a_prov_extra     = msg;
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;
@@ -538,6 +569,7 @@ nni_http_write_data(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 	size_t datasz;
 
 	nni_http_msg_get_data(msg, &data, &datasz);
+	aio->a_prov_extra     = msg;
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = datasz;
 	aio->a_iov[0].iov_buf = data;
