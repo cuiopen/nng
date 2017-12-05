@@ -18,6 +18,11 @@
 // Basic HTTP client tests.
 #include "core/nng_impl.h"
 #include "supplemental/http/http.h"
+#include "supplemental/sha1/sha1.h"
+
+const uint8_t utf8_sha1sum[20] = { 0x54, 0xf3, 0xb8, 0xbb, 0xfe, 0xda, 0x6f,
+	0xb4, 0x96, 0xdd, 0xc9, 0x8b, 0x8c, 0x41, 0xf4, 0xfe, 0xe5, 0xa9, 0x7d,
+	0xa9 };
 
 TestMain("HTTP Client", {
 
@@ -78,7 +83,7 @@ TestMain("HTTP Client", {
 			});
 			So(nni_http_msg_set_method(req, "GET") == 0);
 			So(nni_http_msg_set_version(req, "HTTP/1.1") == 0);
-			So(nni_http_msg_set_uri(req, "/get") == 0);
+			So(nni_http_msg_set_uri(req, "/encoding/utf8") == 0);
 			So(nni_http_msg_set_header(
 			       req, "Host", "httpbin.org") == 0);
 			nni_http_write_msg(http, req, iaio);
@@ -88,6 +93,15 @@ TestMain("HTTP Client", {
 			nng_aio_wait(aio);
 			So(nng_aio_result(aio) == 0);
 			So(nni_http_msg_get_status(res) == 200);
+
+			Convey("The message contents are correct", {
+				uint8_t digest[20];
+				void *  data;
+				size_t  sz;
+				nni_http_msg_get_data(res, &data, &sz);
+				nni_sha1(data, sz, digest);
+				So(memcmp(digest, utf8_sha1sum, 20) == 0);
+			});
 		});
 	});
 });

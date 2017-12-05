@@ -124,6 +124,7 @@ http_rd_cb(void *arg)
 	nni_mtx_lock(&http->mtx);
 
 	if ((rv = nni_aio_result(aio)) != 0) {
+		nni_panic("ERROR");
 		goto error;
 	}
 
@@ -188,6 +189,7 @@ http_rd_cb(void *arg)
 		rv = nni_http_msg_parse_data(
 		    msg, http->rd_buf + http->rd_get, cnt, &n);
 		http->rd_get += n; // Unconditionally -- EGAIN does consume.
+		cnt -= n;
 		switch (rv) {
 		case 0: // Completely read the message.
 			nni_aio_list_remove(uaio);
@@ -206,16 +208,18 @@ http_rd_cb(void *arg)
 				http->rd_put = cnt;
 			}
 			if (http->rd_put >= http->rd_bufsz) {
+				nni_panic("ERROR");
 				rv = NNG_EPROTO; // HTTP data line too big.
 				goto error;
 			}
-			aio->a_niov           = 0;
+			aio->a_niov           = 1;
 			aio->a_iov[0].iov_buf = (uint8_t *) http->rd_buf + cnt;
 			aio->a_iov[0].iov_len = http->rd_bufsz - cnt;
 			http->rd(http->sock, aio);
 			nni_mtx_unlock(&http->mtx);
 			return;
 		default:
+			nni_panic("ERROR");
 			// Protocol error (bad parse).
 			goto error;
 		}
