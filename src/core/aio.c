@@ -66,7 +66,8 @@ nni_aio_init(nni_aio **aiop, nni_cb cb, void *arg)
 	}
 	memset(aio, 0, sizeof(*aio));
 	nni_cv_init(&aio->a_cv, &nni_aio_lk);
-	aio->a_expire = NNI_TIME_NEVER;
+	aio->a_expire  = NNI_TIME_NEVER;
+	aio->a_timeout = NNG_DURATION_INFINITE;
 	if (arg == NULL) {
 		arg = aio;
 	}
@@ -116,9 +117,9 @@ nni_aio_stop(nni_aio *aio)
 }
 
 void
-nni_aio_set_timeout(nni_aio *aio, nni_time when)
+nni_aio_set_timeout(nni_aio *aio, nni_duration when)
 {
-	aio->a_expire = when;
+	aio->a_timeout = when;
 }
 
 void
@@ -219,8 +220,21 @@ nni_aio_start(nni_aio *aio, nni_aio_cancelfn cancelfn, void *data)
 	aio->a_prov_cancel = cancelfn;
 	aio->a_prov_data   = data;
 	aio->a_active      = 1;
-	if (aio->a_expire != NNI_TIME_NEVER) {
+
+	// Convert the relative timeout to an absolute timeout.
+	switch (aio->a_timeout) {
+	case NNG_DURATION_ZERO:
+		aio->a_expire = NNI_TIME_ZERO;
 		nni_aio_expire_add(aio);
+		break;
+	case NNG_DURATION_INFINITE:
+	case NNG_DURATION_DEFAULT:
+		aio->a_expire = NNI_TIME_NEVER;
+		break;
+	default:
+		aio->a_expire = nni_clock() + aio->a_timeout;
+		nni_aio_expire_add(aio);
+		break;
 	}
 	nni_mtx_unlock(&nni_aio_lk);
 	return (0);

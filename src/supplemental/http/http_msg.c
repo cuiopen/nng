@@ -60,8 +60,8 @@ nni_http_msg_del_header(nni_http_msg *msg, const char *key)
 	return (NNG_ENOENT);
 }
 
-static int
-http_msg_set_header(nni_http_msg *msg, const char *key, const char *val)
+int
+nni_http_msg_set_header(nni_http_msg *msg, const char *key, const char *val)
 {
 	http_header *h;
 	NNI_LIST_FOREACH (&msg->hdrs, h) {
@@ -90,7 +90,7 @@ http_msg_set_header(nni_http_msg *msg, const char *key, const char *val)
 		NNI_FREE_STRUCT(h);
 		return (NNG_ENOMEM);
 	}
-
+	strncpy(h->value, val, strlen(val) + 1);
 	nni_list_append(&msg->hdrs, h);
 	return (0);
 }
@@ -151,7 +151,7 @@ nni_http_msg_set_data(nni_http_msg *msg, const void *data, size_t sz)
 	char buf[16];
 	(void) snprintf(buf, sizeof(buf), "%u", (unsigned) sz);
 
-	if ((rv = http_msg_set_header(msg, "Content-Length", buf)) != 0) {
+	if ((rv = nni_http_msg_set_header(msg, "Content-Length", buf)) != 0) {
 		return (rv);
 	}
 
@@ -254,7 +254,7 @@ http_msg_prepare(nni_http_msg *m)
 	char * buf;
 	char * vers;
 
-	if (m->vers == NULL) {
+	if ((vers = m->vers) == NULL) {
 		vers = "HTTP/1.1"; // reasonable default
 	}
 
@@ -275,7 +275,7 @@ http_msg_prepare(nni_http_msg *m)
 	len += http_sprintf_headers(NULL, 0, &m->hdrs);
 	len += 5; // \r\n\r\n\0
 
-	if (len > m->bufsz) {
+	if (len <= m->bufsz) {
 		buf = m->buf;
 	} else {
 		if ((buf = nni_alloc(len)) == NULL) {

@@ -151,6 +151,7 @@ add_nng_test(pair1 5)
 add_nng_test(udp 5)
 add_nng_test(zt 60)
 add_nng_test(multistress 60)
+add_nng_test(httpclient 30)
 
 # compatbility tests
 # We only support these if ALL the legacy protocols are supported.  This

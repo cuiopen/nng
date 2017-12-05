@@ -24,7 +24,7 @@ typedef struct nni_http_tran {
 // nni_http_msg_init initializes an HTTP request.
 extern int         nni_http_msg_init_req(nni_http_msg **);
 extern int         nni_http_msg_init_res(nni_http_msg **);
-extern void        nni_http_msg_free(nni_http_msg *);
+extern void        nni_http_msg_fini(nni_http_msg *);
 extern int         nni_http_msg_set_method(nni_http_msg *, const char *);
 extern const char *nni_http_msg_get_method(nni_http_msg *);
 extern int         nni_http_msg_set_version(nni_http_msg *, const char *);
@@ -121,7 +121,7 @@ enum { NNI_HTTP_STATUS_CONTINUE                  = 100,
 typedef struct nni_http nni_http;
 
 extern int  nni_http_init(nni_http **, nni_http_tran *);
-extern int  nni_http_close(nni_http *);
+extern void nni_http_close(nni_http *);
 extern void nni_http_fini(nni_http *);
 
 // Reading messages -- the caller must supply a preinitialized (but otherwise

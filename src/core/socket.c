@@ -775,22 +775,8 @@ nni_sock_closeall(void)
 static void
 nni_sock_normalize_expiration(nni_aio *aio, nni_duration def)
 {
-	if (aio->a_reltime) {
-		if (aio->a_expire == (nni_time) -2) {
-			aio->a_expire = def;
-		}
-		switch (aio->a_expire) {
-		case (nni_time) 0:
-			aio->a_expire = NNI_TIME_ZERO;
-			break;
-		case (nni_time) -1:
-			aio->a_expire = NNI_TIME_NEVER;
-			break;
-		default:
-			aio->a_expire = nni_clock() + aio->a_expire;
-			break;
-		}
-		aio->a_reltime = 0;
+	if (aio->a_timeout == (nni_duration) -2) {
+		aio->a_timeout = def;
 	}
 }
 

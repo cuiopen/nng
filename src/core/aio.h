@@ -22,9 +22,10 @@ typedef void (*nni_aio_cancelfn)(nni_aio *, int);
 
 // An nni_aio is an async I/O handle.
 struct nni_aio {
-	int      a_result; // Result code (nng_errno)
-	size_t   a_count;  // Bytes transferred (I/O only)
-	nni_time a_expire;
+	int          a_result;  // Result code (nng_errno)
+	size_t       a_count;   // Bytes transferred (I/O only)
+	nni_time     a_expire;  // Absolute timeout
+	nni_duration a_timeout; // Relative timeout
 
 	// These fields are private to the aio framework.
 	nni_cv   a_cv;
@@ -35,7 +36,6 @@ struct nni_aio {
 	unsigned a_expiring : 1; // expiration callback in progress
 	unsigned a_waiting : 1;  // a thread is waiting for this to finish
 	unsigned a_synch : 1;    // run completion synchronously
-	unsigned a_reltime : 1;  // expiration time is relative
 	nni_task a_task;
 
 	// Read/write operations.
@@ -122,10 +122,10 @@ extern void *   nni_aio_get_ep(nni_aio *);
 // completion callback.
 void nni_aio_set_synch(nni_aio *);
 
-// nni_aio_set_timeout sets the timeout (absolute) when the AIO will
+// nni_aio_set_timeout sets the timeout (relative) when the AIO will
 // be canceled.  The cancelation does not happen until after nni_aio_start
 // is called.
-extern void nni_aio_set_timeout(nni_aio *, nni_time);
+extern void nni_aio_set_timeout(nni_aio *, nni_duration);
 
 // nni_aio_result returns the result code (0 on success, or an NNG errno)
 // for the operation.  It is only valid to call this when the operation is
