@@ -185,7 +185,7 @@ http_rd_cb(void *arg)
 		// we load the message data and use the parser to read data
 		// from the connection's buffer in place.
 
-		rv = nni_http_msg_parse(
+		rv = nni_http_msg_parse_data(
 		    msg, http->rd_buf + http->rd_get, cnt, &n);
 		http->rd_get += n; // Unconditionally -- EGAIN does consume.
 		switch (rv) {

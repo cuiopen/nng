@@ -127,7 +127,7 @@ nni_http_msg_add_header(nni_http_msg *msg, const char *key, const char *val)
 		NNI_FREE_STRUCT(h);
 		return (NNG_ENOMEM);
 	}
-
+	strncpy(h->value, val, strlen(val) + 1);
 	nni_list_append(&msg->hdrs, h);
 	return (0);
 }
@@ -539,7 +539,7 @@ http_scan_line(char *buf, size_t n, size_t *lenp)
 				return (NNG_EPROTO);
 			}
 			buf[len - 1] = '\0';
-			*lenp        = len;
+			*lenp        = len + 1;
 			return (0);
 		}
 		// If we have a control character (other than CR), or a CR
@@ -600,8 +600,9 @@ http_msg_parse(nni_http_msg *msg, char *buf, size_t n, size_t *lenp, bool dat)
 				rv = NNG_ENOMEM;
 				break;
 			}
-			msg->datasz   = (size_t) cls;
+			msg->datasz   = (size_t) clen;
 			msg->datawidx = 0;
+			msg->freedata = true;
 			continue;
 		}
 
@@ -641,5 +642,5 @@ nni_http_msg_parse(nni_http_msg *msg, char *buf, size_t n, size_t *lenp)
 int
 nni_http_msg_parse_data(nni_http_msg *msg, char *buf, size_t n, size_t *lenp)
 {
-	return (http_msg_parse(msg, buf, n, lenp, false));
+	return (http_msg_parse(msg, buf, n, lenp, true));
 }
