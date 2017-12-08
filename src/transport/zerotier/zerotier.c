@@ -1292,7 +1292,7 @@ zt_wire_packet_send_cb(void *arg)
 	nni_aio *    aio = arg;
 	zt_send_hdr *hdr;
 
-	hdr = nni_aio_get_data(aio);
+	hdr = nni_aio_get_data(aio, 0);
 	nni_free(hdr, hdr->len + sizeof(*hdr));
 	nni_aio_fini_cb(aio);
 }
@@ -1355,7 +1355,7 @@ zt_wire_packet_send(ZT_Node *node, void *userptr, void *thr, int64_t socket,
 	buf += sizeof(*hdr);
 
 	memcpy(buf, data, len);
-	nni_aio_set_data(aio, hdr);
+	nni_aio_set_data(aio, hdr, 0);
 	hdr->sa  = addr;
 	hdr->len = len;
 

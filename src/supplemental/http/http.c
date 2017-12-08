@@ -401,6 +401,27 @@ nni_http_read_msg(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 }
 
 void
+nni_http_write_req(nni_http *http, nni_http_req *req, nni_aio *aio)
+{
+	int    rv;
+	void * buf;
+	size_t bufsz;
+
+	if ((rv = nni_http_req_get_buf(req, &buf, &bufsz)) != 0) {
+		nni_aio_finish_error(aio, rv);
+		return;
+	}
+	aio->a_prov_extra     = req;
+	aio->a_niov           = 1;
+	aio->a_iov[0].iov_len = bufsz;
+	aio->a_iov[0].iov_buf = buf;
+
+	nni_mtx_lock(&http->mtx);
+	http_wr_submit(http, aio);
+	nni_mtx_unlock(&http->mtx);
+}
+
+void
 nni_http_write_msg(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 {
 	int    rv;
@@ -416,50 +437,6 @@ nni_http_write_msg(nni_http *http, nni_http_msg *msg, nni_aio *aio)
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;
 
-	nni_mtx_lock(&http->mtx);
-	http_wr_submit(http, aio);
-	nni_mtx_unlock(&http->mtx);
-}
-
-void
-nni_http_write_msg_data(nni_http *http, nni_http_msg *msg, nni_aio *aio)
-{
-	int    rv;
-	void * buf;
-	size_t bufsz;
-	void * data;
-	size_t datasz;
-
-	if ((rv = nni_http_msg_get_buf(msg, &buf, &bufsz)) != 0) {
-		nni_aio_finish_error(aio, rv);
-		return;
-	}
-	nni_http_msg_get_data(msg, &data, &datasz);
-	aio->a_prov_extra     = msg;
-	aio->a_niov           = 1;
-	aio->a_iov[0].iov_len = bufsz;
-	aio->a_iov[0].iov_buf = buf;
-	if (datasz > 0) {
-		aio->a_iov[1].iov_len = datasz;
-		aio->a_iov[1].iov_buf = data;
-		aio->a_niov++;
-	}
-	nni_mtx_lock(&http->mtx);
-	http_wr_submit(http, aio);
-	nni_mtx_unlock(&http->mtx);
-}
-
-void
-nni_http_write_data(nni_http *http, nni_http_msg *msg, nni_aio *aio)
-{
-	void * data;
-	size_t datasz;
-
-	nni_http_msg_get_data(msg, &data, &datasz);
-	aio->a_prov_extra     = msg;
-	aio->a_niov           = 1;
-	aio->a_iov[0].iov_len = datasz;
-	aio->a_iov[0].iov_buf = data;
 	nni_mtx_lock(&http->mtx);
 	http_wr_submit(http, aio);
 	nni_mtx_unlock(&http->mtx);

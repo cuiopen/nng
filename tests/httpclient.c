@@ -62,7 +62,7 @@ TestMain("HTTP Client", {
 		});
 		Convey("We can initiate a message", {
 			nni_http *    http;
-			nni_http_msg *req;
+			nni_http_req *req;
 			nni_http_msg *res;
 			nni_http_tran t;
 
@@ -74,19 +74,20 @@ TestMain("HTTP Client", {
 			So(nni_http_init(&http, &t) == 0);
 			So(http != NULL);
 
-			So(nni_http_msg_init_req(&req) == 0);
+			So(nni_http_req_init(&req) == 0);
 			So(nni_http_msg_init_res(&res) == 0);
 			Reset({
 				nni_http_close(http);
-				nni_http_msg_fini(req);
+				nni_http_req_fini(req);
 				nni_http_msg_fini(res);
 			});
-			So(nni_http_msg_set_method(req, "GET") == 0);
-			So(nni_http_msg_set_version(req, "HTTP/1.1") == 0);
-			So(nni_http_msg_set_uri(req, "/encoding/utf8") == 0);
-			So(nni_http_msg_set_header(
+			So(nni_http_req_set_method(req, "GET") == 0);
+			So(nni_http_req_set_version(req, "HTTP/1.1") == 0);
+			So(nni_http_req_set_uri(req, "/encoding/utf8") == 0);
+			So(nni_http_req_set_header(
 			       req, "Host", "httpbin.org") == 0);
-			nni_http_write_msg(http, req, iaio);
+			nni_http_write_req(http, req, iaio);
+
 			nng_aio_wait(aio);
 			So(nng_aio_result(aio) == 0);
 			nni_http_read_msg(http, res, iaio);

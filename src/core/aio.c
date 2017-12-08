@@ -159,15 +159,54 @@ nni_aio_get_ep(nni_aio *aio)
 }
 
 void
-nni_aio_set_data(nni_aio *aio, void *data)
+nni_aio_set_data(nni_aio *aio, void *data, int index)
 {
-	aio->a_data = data;
+	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_user_data))) {
+		aio->a_user_data[index] = data;
+	}
 }
 
 void *
-nni_aio_get_data(nni_aio *aio)
+nni_aio_get_data(nni_aio *aio, int index)
 {
-	return (aio->a_data);
+	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_user_data))) {
+		return (aio->a_user_data[index]);
+	}
+	return (NULL);
+}
+
+void
+nni_aio_set_input(nni_aio *aio, void *data, int index)
+{
+	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_inputs))) {
+		aio->a_inputs[index] = data;
+	}
+}
+
+void *
+nni_aio_get_input(nni_aio *aio, int index)
+{
+	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_inputs))) {
+		return (aio->a_inputs[index]);
+	}
+	return (NULL);
+}
+
+void
+nni_aio_set_output(nni_aio *aio, void *data, int index)
+{
+	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_outputs))) {
+		aio->a_outputs[index] = data;
+	}
+}
+
+void *
+nni_aio_get_output(nni_aio *aio, int index)
+{
+	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_outputs))) {
+		return (aio->a_outputs[index]);
+	}
+	return (NULL);
 }
 
 int

@@ -11,8 +11,11 @@
 #ifndef NNG_SUPPLEMENTAL_HTTP_HTTP_H
 #define NNG_SUPPLEMENTAL_HTTP_HTTP_H
 
+#include <stdbool.h>
+
 // nni_http_msg represents an HTTP request or response message.
 typedef struct nni_http_msg nni_http_msg;
+typedef struct nni_http_res nni_http_res;
 
 typedef struct nni_http_tran {
 	void *h_data;
@@ -21,29 +24,46 @@ typedef struct nni_http_tran {
 	void (*h_close)(void *);
 } nni_http_tran;
 
+typedef struct nni_http_req nni_http_req;
+
+extern int  nni_http_req_init(nni_http_req **);
+extern void nni_http_req_fini(nni_http_req *);
+extern void nni_http_req_reset(nni_http_req *);
+extern int nni_http_req_set_header(nni_http_req *, const char *, const char *);
+extern int nni_http_req_add_header(nni_http_req *, const char *, const char *);
+extern int nni_http_req_del_header(nni_http_req *, const char *);
+extern int nni_http_req_get_buf(nni_http_req *, void **, size_t *);
+extern int nni_http_req_set_method(nni_http_req *, const char *);
+extern int nni_http_req_set_version(nni_http_req *, const char *);
+extern int nni_http_req_set_uri(nni_http_req *, const char *);
+extern const char *nni_http_req_get_header(nni_http_req *, const char *);
+extern const char *nni_http_req_get_header(nni_http_req *, const char *);
+extern const char *nni_http_req_get_version(nni_http_req *);
+extern const char *nni_http_req_get_uri(nni_http_req *);
+
+extern int  nni_http_res_init(nni_http_res **);
+extern void nni_http_res_fini(nni_http_res *);
+extern void nni_http_res_reset(nni_http_res *);
+extern int  nni_http_res_get_buf(nni_http_res *, void **, size_t *);
+extern int nni_http_res_set_header(nni_http_res *, const char *, const char *);
+extern int nni_http_res_add_header(nni_http_res *, const char *, const char *);
+extern int nni_http_res_del_header(nni_http_res *, const char *);
+extern const char *nni_http_res_get_header(nni_http_res *, const char *);
+
 // nni_http_msg_init initializes an HTTP request.
-extern int         nni_http_msg_init_req(nni_http_msg **);
 extern int         nni_http_msg_init_res(nni_http_msg **);
 extern void        nni_http_msg_fini(nni_http_msg *);
-extern int         nni_http_msg_set_method(nni_http_msg *, const char *);
-extern const char *nni_http_msg_get_method(nni_http_msg *);
-extern int         nni_http_msg_set_version(nni_http_msg *, const char *);
 extern const char *nni_http_msg_get_version(nni_http_msg *);
-extern const char *nni_http_msg_get_uri(nni_http_msg *);
-extern int         nni_http_msg_set_uri(nni_http_msg *, const char *);
 extern const char *nni_http_msg_get_header(nni_http_msg *, const char *);
-extern int         nni_http_msg_del_header(nni_http_msg *, const char *);
 extern int         nni_http_msg_set_status(nni_http_msg *, int, const char *);
 extern int         nni_http_msg_get_status(nni_http_msg *);
 extern const char *nni_http_msg_get_reason(nni_http_msg *);
-
 extern int nni_http_msg_set_header(nni_http_msg *, const char *, const char *);
 extern int nni_http_msg_set_data(nni_http_msg *, const void *, size_t);
 extern int nni_http_msg_copy_data(nni_http_msg *, const void *, size_t);
 extern void nni_http_msg_get_data(nni_http_msg *, void **, size_t *);
 extern int  nni_http_msg_parse(nni_http_msg *, char *, size_t, size_t *);
 extern int  nni_http_msg_parse_data(nni_http_msg *, char *, size_t, size_t *);
-extern int  nni_http_msg_get_buf(nni_http_msg *, void **, size_t *);
 
 // HTTP status codes.  This list is not exhaustive.
 enum { NNI_HTTP_STATUS_CONTINUE                  = 100,
@@ -72,6 +92,8 @@ enum { NNI_HTTP_STATUS_CONTINUE                  = 100,
 	NNI_HTTP_STATUS_PAYMENT_REQUIRED         = 402,
 	NNI_HTTP_STATUS_FORBIDDEN                = 403,
 	NNI_HTTP_STATUS_NOT_FOUND                = 404,
+	NNI_HTTP_STATUS_METHOD_NOT_ALLOWED       = 405,
+	NNI_HTTP_STATUS_NOT_ACCEPTABLE           = 406,
 	NNI_HTTP_STATUS_PROXY_AUTH_REQUIRED      = 407,
 	NNI_HTTP_STATUS_REQUEST_TIMEOUT          = 408,
 	NNI_HTTP_STATUS_CONFLICT                 = 409,
@@ -128,13 +150,122 @@ extern void nni_http_fini(nni_http *);
 // idle) message.  We recommend the caller store this in the aio's user data.
 // Note that the iovs of the aio's are clobbered by these methods -- callers
 // must not use them for any other purpose.
+
+extern void nni_http_write_req(nni_http *, nni_http_req *, nni_aio *);
+extern void nni_http_write_res(nni_http *, nni_http_res *, nni_aio *);
+
 extern void nni_http_read_msg(nni_http *, nni_http_msg *, nni_aio *);
-extern void nni_http_read_data(nni_http *, nni_http_msg *, nni_aio *);
-extern void nni_http_read_msg_data(nni_http *, nni_http_msg *, nni_aio *);
 extern void nni_http_write_msg(nni_http *, nni_http_msg *, nni_aio *);
-extern void nni_http_write_data(nni_http *, nni_http_msg *, nni_aio *);
-extern void nni_http_write_msg_data(nni_http *, nni_http_msg *, nni_aio *);
 extern void nni_http_read(nni_http *, nni_aio *);
 extern void nni_http_write(nni_http *, nni_aio *);
+
+// An HTTP client works like an HTTP channel, but it has the logic to
+// establish the connection, etc.  At present no connection caching is
+// used, but that can change in the future.
+typedef struct nni_http_client nni_http_client;
+
+extern int nni_http_client_init(nni_http_client *, const char *);
+
+typedef struct nni_http_server nni_http_server;
+
+typedef struct {
+	// h_path is the relative URI that we are going to match against.
+	// Must not be NULL.  Note that query parameters (things following
+	// a "?" at the end of the path) are ignored when matching.  This
+	// field may not be NULL.
+	const char *h_path;
+
+	// h_method is the HTTP method to handle such as "GET" or "POST".
+	// Must not be empty or NULL.  If the incoming method is HEAD, then
+	// the server will process HEAD the same as GET, but will not send
+	// any response body.
+	const char *h_method;
+
+	// h_host is used to match on a specific Host: entry.  If left NULL,
+	// then this handler will match regardless of the Host: value.
+	const char *h_host;
+
+	// h_is_dir indicates that the path represents a directory, and
+	// any path which is a logically below it should also be matched.
+	// This means that "/phone" will match for "/phone/bob" but not
+	// "/phoneme/ma".  Be advised that it is not possible to register
+	// a handler for a parent and a different handler for children.
+	// (This restriction may be lifted in the future.)
+	bool h_is_dir;
+
+	// h_cb is a callback that handles the request.  The conventions
+	// are as follows:
+	//
+	// inputs:
+	//   0 - nni_http * for the actual underlying HTTP channel
+	//   1 - nni_http_msg * for the HTTP request object
+	//   2 - void * for the opaque pointer supplied at registration
+	//
+	// outputs:
+	//   0 - (optional) nni_http * for an HTTP response (see below)
+	//
+	// The callback may choose to return the a response object in output 0,
+	// in which case the framework will handle sending the reply.
+	// (Response entity content is also sent if the response data
+	// is not NULL.)  The callback may instead do it's own replies, in
+	// which case the response output should be NULL.
+	//
+	// Note that any request entity data is *NOT* supplied automatically
+	// with the request object; the callback is expected to call the
+	// nni_http_read_data method to retrieve any message data based upon
+	// the presence of headers. (It may also call nni_http_read or
+	// nni_http_write on the channel as it sees fit.)
+	//
+	// An "upgrader" that wants to take over complete ownership of the
+	// channel should not call the completion callback until the
+	// channel is closed.  Note that timeouts on replies are automatically
+	// disabled.  (An example of an "upgrader" would be a websocket
+	// implementation.)
+	void (*h_cb)(nni_aio *);
+} nni_http_handler;
+
+extern int nni_http_server_init(nni_http_server **);
+
+// nni_http_server_fini closes down the server, and frees all resources
+// associated with it.  It does not affect any upgraded connections.
+extern void nni_http_server_fini(nni_http_server *);
+
+// nni_http_server_add_handler registers a new handler on the server.
+// This function will return NNG_EADDRINUSE if a conflicting handler
+// is already registered (i.e. a handler with the same value for Host,
+// Method, and URL.)  The first parameter receives an opaque handle to
+// the handler, that can be used to unregister the handler later.
+extern int nni_http_server_add_handler(
+    void **, nni_http_server *, nni_http_handler *, void *);
+
+extern void nni_http_server_del_handler(nni_http_server *, void *);
+
+// The server has its own handlers for certain error conditions.  You can
+// override the handlers for those using the following.  Most commonly this
+// will be to supply a custom 404 page.  Note that unlike a normal handler,
+// it is not possible to override the status code.  Not every error code
+// will be handleable, but many of the 4xx codes are, including especially
+// 404 and 405.  The callback function has the same semantics as the
+// h_cb member of nni_http_handler.
+extern int nni_http_server_set_error_handler(
+    nni_http_server *, int, void (*)(nni_aio *), void *);
+
+// nni_http_server_start starts listening on the supplied port.
+extern int nni_http_server_start(nni_http_server *, nng_sockaddr *);
+
+// nni_http_server_stop stops the server, closing the listening socket.
+// Connections that have been "upgraded" are unaffected.  Connections
+// associated with a callback will complete their callback, and then close.
+extern void nni_http_server_stop(nni_http_server *);
+
+// TLS will use
+// extern int nni_http_server_start_tls(nni_http_server *, nng_sockaddr *,
+//     nni_tls_config *);
+
+// OBSOLETE STUFF
+
+extern int nni_http_msg_get_buf(nni_http_msg *, void **, size_t *);
+extern int nni_http_msg_set_version(nni_http_msg *, const char *);
+extern int nni_http_msg_set_method(nni_http_msg *, const char *);
 
 #endif // NNG_SUPPLEMENTAL_HTTP_HTTP_H
