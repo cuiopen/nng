@@ -14,8 +14,9 @@
 #include <stdbool.h>
 
 // nni_http_msg represents an HTTP request or response message.
-typedef struct nni_http_msg nni_http_msg;
-typedef struct nni_http_res nni_http_res;
+typedef struct nni_http_msg    nni_http_msg;
+typedef struct nni_http_res    nni_http_res;
+typedef struct nni_http_entity nni_http_entity;
 
 typedef struct nni_http_tran {
 	void *h_data;
@@ -40,6 +41,7 @@ extern const char *nni_http_req_get_header(nni_http_req *, const char *);
 extern const char *nni_http_req_get_header(nni_http_req *, const char *);
 extern const char *nni_http_req_get_version(nni_http_req *);
 extern const char *nni_http_req_get_uri(nni_http_req *);
+extern int nni_http_req_parse(nni_http_req *, void *, size_t, size_t *);
 
 extern int  nni_http_res_init(nni_http_res **);
 extern void nni_http_res_fini(nni_http_res *);
@@ -49,21 +51,14 @@ extern int nni_http_res_set_header(nni_http_res *, const char *, const char *);
 extern int nni_http_res_add_header(nni_http_res *, const char *, const char *);
 extern int nni_http_res_del_header(nni_http_res *, const char *);
 extern const char *nni_http_res_get_header(nni_http_res *, const char *);
-
-// nni_http_msg_init initializes an HTTP request.
-extern int         nni_http_msg_init_res(nni_http_msg **);
-extern void        nni_http_msg_fini(nni_http_msg *);
-extern const char *nni_http_msg_get_version(nni_http_msg *);
-extern const char *nni_http_msg_get_header(nni_http_msg *, const char *);
-extern int         nni_http_msg_set_status(nni_http_msg *, int, const char *);
-extern int         nni_http_msg_get_status(nni_http_msg *);
-extern const char *nni_http_msg_get_reason(nni_http_msg *);
-extern int nni_http_msg_set_header(nni_http_msg *, const char *, const char *);
-extern int nni_http_msg_set_data(nni_http_msg *, const void *, size_t);
-extern int nni_http_msg_copy_data(nni_http_msg *, const void *, size_t);
-extern void nni_http_msg_get_data(nni_http_msg *, void **, size_t *);
-extern int  nni_http_msg_parse(nni_http_msg *, char *, size_t, size_t *);
-extern int  nni_http_msg_parse_data(nni_http_msg *, char *, size_t, size_t *);
+extern const char *nni_http_res_get_version(nni_http_res *);
+extern const char *nni_http_res_get_reason(nni_http_res *);
+extern int         nni_http_res_get_status(nni_http_res *);
+extern int  nni_http_res_parse(nni_http_res *, void *, size_t, size_t *);
+extern int  nni_http_res_set_data(nni_http_res *, const void *, size_t);
+extern int  nni_http_res_copy_data(nni_http_res *, const void *, size_t);
+extern int  nni_http_res_alloc_data(nni_http_res *, size_t);
+extern void nni_http_res_get_data(nni_http_res *, void **, size_t *);
 
 // HTTP status codes.  This list is not exhaustive.
 enum { NNI_HTTP_STATUS_CONTINUE                  = 100,
@@ -153,10 +148,11 @@ extern void nni_http_fini(nni_http *);
 
 extern void nni_http_write_req(nni_http *, nni_http_req *, nni_aio *);
 extern void nni_http_write_res(nni_http *, nni_http_res *, nni_aio *);
+extern void nni_http_read_req(nni_http *, nni_http_req *, nni_aio *);
+extern void nni_http_read_res(nni_http *, nni_http_res *, nni_aio *);
 
-extern void nni_http_read_msg(nni_http *, nni_http_msg *, nni_aio *);
-extern void nni_http_write_msg(nni_http *, nni_http_msg *, nni_aio *);
 extern void nni_http_read(nni_http *, nni_aio *);
+extern void nni_http_read_full(nni_http *, nni_aio *);
 extern void nni_http_write(nni_http *, nni_aio *);
 
 // An HTTP client works like an HTTP channel, but it has the logic to
@@ -261,11 +257,5 @@ extern void nni_http_server_stop(nni_http_server *);
 // TLS will use
 // extern int nni_http_server_start_tls(nni_http_server *, nng_sockaddr *,
 //     nni_tls_config *);
-
-// OBSOLETE STUFF
-
-extern int nni_http_msg_get_buf(nni_http_msg *, void **, size_t *);
-extern int nni_http_msg_set_version(nni_http_msg *, const char *);
-extern int nni_http_msg_set_method(nni_http_msg *, const char *);
 
 #endif // NNG_SUPPLEMENTAL_HTTP_HTTP_H

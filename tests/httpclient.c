@@ -60,10 +60,11 @@ TestMain("HTTP Client", {
 			nni_plat_tcp_ep_fini(ep);
 			nni_plat_tcp_pipe_fini(p);
 		});
+
 		Convey("We can initiate a message", {
 			nni_http *    http;
 			nni_http_req *req;
-			nni_http_msg *res;
+			nni_http_res *res;
 			nni_http_tran t;
 
 			t.h_data  = p;
@@ -75,11 +76,11 @@ TestMain("HTTP Client", {
 			So(http != NULL);
 
 			So(nni_http_req_init(&req) == 0);
-			So(nni_http_msg_init_res(&res) == 0);
+			So(nni_http_res_init(&res) == 0);
 			Reset({
 				nni_http_close(http);
 				nni_http_req_fini(req);
-				nni_http_msg_fini(res);
+				nni_http_res_fini(res);
 			});
 			So(nni_http_req_set_method(req, "GET") == 0);
 			So(nni_http_req_set_version(req, "HTTP/1.1") == 0);
@@ -90,16 +91,38 @@ TestMain("HTTP Client", {
 
 			nng_aio_wait(aio);
 			So(nng_aio_result(aio) == 0);
-			nni_http_read_msg(http, res, iaio);
+			nni_http_read_res(http, res, iaio);
 			nng_aio_wait(aio);
 			So(nng_aio_result(aio) == 0);
-			So(nni_http_msg_get_status(res) == 200);
+			So(nni_http_res_get_status(res) == 200);
 
-			Convey("The message contents are correct", {
-				uint8_t digest[20];
-				void *  data;
-				size_t  sz;
-				nni_http_msg_get_data(res, &data, &sz);
+			Convey("The message contents are  correct", {
+				uint8_t     digest[20];
+				void *      data;
+				const char *cstr;
+				size_t      sz;
+
+				cstr = nni_http_res_get_header(
+				    res, "Content-Length");
+				So(cstr != NULL);
+				sz = atoi(cstr);
+				So(sz > 0);
+
+				data = nni_alloc(sz);
+				So(data != NULL);
+				Reset({ nni_free(data, sz); });
+
+				iaio->a_niov           = 1;
+				iaio->a_iov[0].iov_len = sz;
+				iaio->a_iov[0].iov_buf = data;
+
+				nni_aio_wait(iaio);
+				So(nng_aio_result(aio) == 0);
+
+				nni_http_read_full(http, iaio);
+				nni_aio_wait(iaio);
+				So(nni_aio_result(iaio) == 0);
+
 				nni_sha1(data, sz, digest);
 				So(memcmp(digest, utf8_sha1sum, 20) == 0);
 			});

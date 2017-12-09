@@ -18,6 +18,24 @@
 // If you need more than that, you need something we can't do.
 #define HTTP_BUFSIZE 8192
 
+// types of reads
+#if 0
+#define HTTP_RD_RAW ((void *) 0)  // raw read - may return partial read
+#define HTTP_RD_REQ ((void *) 1)  // resquest located in prov_extra[1]
+#define HTTP_RD_RES ((void *) 2)  // response located in prov_extra[1]
+#define HTTP_RD_FULL ((void *) 3) // resid located in prov_extra[1]
+#endif
+
+enum read_flavor {
+	HTTP_RD_RAW,
+	HTTP_RD_REQ,
+	HTTP_RD_RES,
+	HTTP_RD_FULL,
+};
+
+#define SET_RD_FLAVOR(aio, f) (aio)->a_prov_extra[0] = ((void *) (intptr_t)(f))
+#define GET_RD_FLAVOR(aio) (int) ((intptr_t) aio->a_prov_extra[0])
+
 struct nni_http {
 	void *sock;
 	void (*rd)(void *, nni_aio *);
@@ -34,10 +52,10 @@ struct nni_http {
 
 	nni_mtx mtx;
 
-	char * rd_buf;
-	size_t rd_get;
-	size_t rd_put;
-	size_t rd_bufsz;
+	uint8_t *rd_buf;
+	size_t   rd_get;
+	size_t   rd_put;
+	size_t   rd_bufsz;
 };
 
 static void
@@ -77,35 +95,133 @@ nni_http_close(nni_http *http)
 	nni_mtx_unlock(&http->mtx);
 }
 
+// http_rd_buf attempts to satisfy the read from data in the buffer.
+// It can return the following:
+//
+//  0: read satisfied.
+//  NNG_EAGAIN: read partially satisfied - retrying automatically
+// XXX: read
+static int
+http_rd_buf(nni_http *http, nni_aio *aio)
+{
+	size_t   cnt = http->rd_put - http->rd_get;
+	size_t   n;
+	uint8_t *rbuf = http->rd_buf;
+	int      i;
+	int      rv;
+	bool     raw = false;
+
+	rbuf += http->rd_get;
+
+	switch (GET_RD_FLAVOR(aio)) {
+	case HTTP_RD_RAW:
+		raw = true; // FALLTHROUGH
+	case HTTP_RD_FULL:
+		for (i = 0; (aio->a_niov != 0) && (cnt != 0); i++) {
+			// Pull up data from the buffer if possible.
+			n = aio->a_iov[0].iov_len;
+			if (n > cnt) {
+				n = cnt;
+			}
+			memcpy(aio->a_iov[0].iov_buf, rbuf, n);
+			aio->a_iov[0].iov_len -= n;
+			aio->a_iov[0].iov_buf += n;
+			http->rd_get += n;
+			rbuf += n;
+			aio->a_count += n;
+			cnt -= n;
+
+			if (aio->a_iov[0].iov_len == 0) {
+				aio->a_niov--;
+				for (i = 0; i < aio->a_niov; i++) {
+					aio->a_iov[i] = aio->a_iov[i + 1];
+				}
+			}
+		}
+
+		if ((aio->a_niov == 0) || (raw && (aio->a_count != 0))) {
+			// Finished the read.  (We are finished if we either
+			// got *all* the data, or we got *some* data for
+			// a raw read.)
+			return (0);
+		}
+
+		// No more data left in the buffer, so use a physio.
+		// (Note that we get here if we either have not completed
+		// a full transaction on a FULL read, or were not even able
+		// to get *any* data for a partial RAW read.)
+		for (i = 0; i < aio->a_niov; i++) {
+			http->rd_aio->a_iov[i] = aio->a_iov[i];
+		}
+		nni_aio_set_data(http->rd_aio, 1, NULL);
+		http->rd_aio->a_niov = aio->a_niov;
+		http->rd(http->sock, http->rd_aio);
+		return (NNG_EAGAIN);
+
+	case HTTP_RD_REQ:
+		rv = nni_http_req_parse(aio->a_prov_extra[1], rbuf, cnt, &n);
+		cnt -= n;
+		http->rd_get += n;
+		if (http->rd_get == http->rd_put) {
+			http->rd_get = http->rd_put = 0;
+		}
+		if (rv == NNG_EAGAIN) {
+			http->rd_aio->a_niov = 1;
+			http->rd_aio->a_iov[0].iov_buf =
+			    http->rd_buf + http->rd_put;
+			http->rd_aio->a_iov[0].iov_len =
+			    http->rd_bufsz - http->rd_put;
+			nni_aio_set_data(http->rd_aio, 1, aio);
+			http->rd(http->sock, http->rd_aio);
+		}
+		return (rv);
+
+	case HTTP_RD_RES:
+		rv = nni_http_res_parse(aio->a_prov_extra[1], rbuf, cnt, &n);
+		cnt -= n;
+		http->rd_get += n;
+		if (http->rd_get == http->rd_put) {
+			http->rd_get = http->rd_put = 0;
+		}
+		if (rv == NNG_EAGAIN) {
+			http->rd_aio->a_niov = 1;
+			http->rd_aio->a_iov[0].iov_buf =
+			    http->rd_buf + http->rd_put;
+			http->rd_aio->a_iov[0].iov_len =
+			    http->rd_bufsz - http->rd_put;
+			nni_aio_set_data(http->rd_aio, 1, aio);
+			http->rd(http->sock, http->rd_aio);
+		}
+		return (rv);
+	}
+	return (NNG_EINVAL);
+}
+
 static void
 http_rd_start(nni_http *http)
 {
 	nni_aio *aio;
 
-	if (http->closed) {
-		while ((aio = nni_list_first(&http->rdq)) != NULL) {
-			nni_aio_list_remove(aio);
-			nni_aio_finish_error(aio, NNG_ECLOSED);
-		}
-		return;
-	}
+	while ((aio = nni_list_first(&http->rdq)) != NULL) {
+		int rv;
 
-	if ((aio = nni_list_first(&http->rdq)) != NULL) {
-
-		http->rd_aio->a_niov = aio->a_niov;
-		for (int i = 0; i < aio->a_niov; i++) {
-			http->rd_aio->a_iov[i] = aio->a_iov[i];
-		}
-
-		// If we already have data in the read buffer, then
-		// just "finish" the lower aio using the residual.
-		if (http->rd_put > http->rd_get) {
-			// The "size" we finish the underlying AIO is
-			// zero, because we haven't transferred any new data.
-			nni_aio_finish(http->rd_aio, 0, 0);
+		if (http->closed) {
+			rv = NNG_ECLOSED;
 		} else {
-			// Submit it down for completion.
-			http->rd(http->sock, http->rd_aio);
+			rv = http_rd_buf(http, aio);
+		}
+		switch (rv) {
+		case NNG_EAGAIN:
+			return;
+		case 0:
+			nni_aio_list_remove(aio);
+			nni_aio_finish(aio, 0, aio->a_count);
+			break;
+		default:
+			nni_aio_list_remove(aio);
+			nni_aio_finish_error(aio, rv);
+			http_close(http);
+			break;
 		}
 	}
 }
@@ -113,129 +229,67 @@ http_rd_start(nni_http *http)
 static void
 http_rd_cb(void *arg)
 {
-	nni_http *    http = arg;
-	nni_aio *     aio  = http->rd_aio;
-	nni_aio *     uaio;
-	nni_http_msg *msg;
-	size_t        cnt;
-	size_t        n;
-	int           rv;
+	nni_http *http = arg;
+	nni_aio * aio  = http->rd_aio;
+	nni_aio * uaio;
+	size_t    cnt;
+	size_t    n;
+	int       rv;
 
 	nni_mtx_lock(&http->mtx);
 
 	if ((rv = nni_aio_result(aio)) != 0) {
-		nni_panic("ERROR");
-		goto error;
+		if ((uaio = nni_list_first(&http->rdq)) != NULL) {
+			nni_aio_list_remove(uaio);
+			nni_aio_finish_error(uaio, rv);
+		}
+		http_close(http);
+		nni_mtx_unlock(&http->mtx);
+		return;
 	}
 
-	n = nni_aio_count(aio);
+	cnt = nni_aio_count(aio);
 
-	// If this was a zero copy read, then just "pass" the result through.
-	if (aio->a_iov[0].iov_buf < (uint8_t *) http->rd_buf ||
-	    aio->a_iov[0].iov_buf >=
-	        (uint8_t *) http->rd_buf + http->rd_bufsz) {
-		NNI_ASSERT(http->rd_get == 0);
-		NNI_ASSERT(http->rd_put == 0);
-		uaio = nni_list_first(&http->rdq);
-		// The uaio has to be present, since we are doing a pass-thru
-		// read. (Otherwise we could be reading into a buffer that
-		// is not valid!)
-		NNI_ASSERT(uaio != NULL);
-		nni_aio_list_remove(uaio);
-		nni_aio_finish(uaio, 0, n);
+	// If we were reading into the buffer, then advance location(s).
+	if ((uaio = nni_aio_get_data(aio, 1)) != NULL) {
+		http->rd_put += cnt;
+		NNI_ASSERT(http->rd_put <= http->rd_bufsz);
 		http_rd_start(http);
 		nni_mtx_unlock(&http->mtx);
 		return;
 	}
 
-	NNI_ASSERT(aio->a_niov == 1);
-	http->rd_put += n;
-	NNI_ASSERT(http->rd_put <= http->rd_bufsz);
-	NNI_ASSERT(http->rd_put >= http->rd_get);
+	// Otherwise we are completing a USER request, and there should
+	// be no data left in the user buffer.
+	NNI_ASSERT(http->rd_get == http->rd_put);
 
-	// If this wasn't a message read, then we just consume the requested
-	// amount of data (or whatever we have left) out of the buffer.
-	cnt = http->rd_put - http->rd_get;
-	while (cnt > 0) {
+	uaio = nni_list_first(&http->rdq);
+	NNI_ASSERT(uaio != NULL);
 
-		if ((uaio = nni_list_first(&http->rdq)) == NULL) {
-			// Left over data.  Leave it for next read.
-			nni_mtx_unlock(&http->mtx);
-			return;
+	for (int i = 0; (uaio->a_niov != 0) && (cnt != 0); i++) {
+		// Pull up data from the buffer if possible.
+		n = uaio->a_iov[0].iov_len;
+		if (n > cnt) {
+			n = cnt;
 		}
-		if ((msg = uaio->a_prov_extra) == NULL) {
-			uaio->a_count = 0;
-			for (int i = 0; n > 0 && i < uaio->a_niov; i++) {
-				n = uaio->a_iov[i].iov_len;
-				if (n > cnt) {
-					n = cnt;
-				}
-				memcpy(uaio->a_iov[i].iov_buf,
-				    http->rd_buf + http->rd_get, n);
-				http->rd_get += n;
-				cnt -= n;
-				uaio->a_count += n;
-			}
-			nni_aio_list_remove(uaio);
-			nni_aio_finish(uaio, 0, uaio->a_count);
-			continue;
-		}
-
-		// NB: When handling AIOs for message transfers, the actual
-		// iov submitted with the user AIO will be ignored. Instead
-		// we load the message data and use the parser to read data
-		// from the connection's buffer in place.
-
-		rv = nni_http_msg_parse_data(
-		    msg, http->rd_buf + http->rd_get, cnt, &n);
-		http->rd_get += n; // Unconditionally -- EGAIN does consume.
+		uaio->a_iov[0].iov_len -= n;
+		uaio->a_iov[0].iov_buf += n;
+		uaio->a_count += n;
 		cnt -= n;
-		switch (rv) {
-		case 0: // Completely read the message.
-			nni_aio_list_remove(uaio);
-			nni_aio_finish(uaio, 0, 0);
-			continue;
-		case NNG_EAGAIN: // We need more data.
-			// Schedule another read.  But first make sure
-			// that we move the present data to the end so that
-			// we have as much room as possible.
-			if (http->rd_get != 0) {
-				for (int i = 0; i < cnt; i++) {
-					http->rd_buf[i] =
-					    http->rd_buf[i + http->rd_get];
-				}
-				http->rd_get = 0;
-				http->rd_put = cnt;
+
+		if (uaio->a_iov[0].iov_len == 0) {
+			uaio->a_niov--;
+			for (i = 0; i < uaio->a_niov; i++) {
+				uaio->a_iov[i] = uaio->a_iov[i + 1];
 			}
-			if (http->rd_put >= http->rd_bufsz) {
-				nni_panic("ERROR");
-				rv = NNG_EPROTO; // HTTP data line too big.
-				goto error;
-			}
-			aio->a_niov           = 1;
-			aio->a_iov[0].iov_buf = (uint8_t *) http->rd_buf + cnt;
-			aio->a_iov[0].iov_len = http->rd_bufsz - cnt;
-			http->rd(http->sock, aio);
-			nni_mtx_unlock(&http->mtx);
-			return;
-		default:
-			nni_panic("ERROR");
-			// Protocol error (bad parse).
-			goto error;
 		}
 	}
 
-	// We consumed all data, possibly start reading some more.
+	// Resubmit the start.  This will attempt to consume data
+	// from the read buffer (there won't be any), and then either
+	// complete the I/O (for HTTP_RD_RAW, or if there is nothing left),
+	// or submit another physio.
 	http_rd_start(http);
-	nni_mtx_unlock(&http->mtx);
-	return;
-
-error:
-	if ((uaio = nni_list_first(&http->rdq)) != NULL) {
-		nni_aio_list_remove(uaio);
-		nni_aio_finish_error(uaio, rv);
-	}
-	http_close(http);
 	nni_mtx_unlock(&http->mtx);
 }
 
@@ -320,7 +374,7 @@ http_wr_cb(void *arg)
 
 	n = nni_aio_count(aio);
 	uaio->a_count += n;
-	if (uaio->a_prov_extra == NULL) {
+	if (uaio->a_prov_extra[0] == NULL) {
 		// For raw data, we just send partial completion
 		// notices to the consumer.
 		goto done;
@@ -388,12 +442,44 @@ http_wr_submit(nni_http *http, nni_aio *aio)
 }
 
 void
-nni_http_read_msg(nni_http *http, nni_http_msg *msg, nni_aio *aio)
+nni_http_read_req(nni_http *http, nni_http_req *req, nni_aio *aio)
 {
-	aio->a_prov_extra     = msg;
-	aio->a_niov           = 1;
-	aio->a_iov[0].iov_len = http->rd_bufsz;
-	aio->a_iov[0].iov_buf = (void *) http->rd_buf;
+	SET_RD_FLAVOR(aio, HTTP_RD_REQ);
+	aio->a_prov_extra[1] = req;
+
+	nni_mtx_lock(&http->mtx);
+	http_rd_submit(http, aio);
+	nni_mtx_unlock(&http->mtx);
+}
+
+void
+nni_http_read_res(nni_http *http, nni_http_res *res, nni_aio *aio)
+{
+	SET_RD_FLAVOR(aio, HTTP_RD_RES);
+	aio->a_prov_extra[1] = res;
+
+	nni_mtx_lock(&http->mtx);
+	http_rd_submit(http, aio);
+	nni_mtx_unlock(&http->mtx);
+}
+
+void
+nni_http_read_full(nni_http *http, nni_aio *aio)
+{
+	aio->a_count = 0;
+	SET_RD_FLAVOR(aio, HTTP_RD_FULL);
+	aio->a_prov_extra[1] = NULL;
+
+	nni_mtx_lock(&http->mtx);
+	http_rd_submit(http, aio);
+	nni_mtx_unlock(&http->mtx);
+}
+
+void
+nni_http_read(nni_http *http, nni_aio *aio)
+{
+	SET_RD_FLAVOR(aio, HTTP_RD_RAW);
+	aio->a_prov_extra[1] = NULL;
 
 	nni_mtx_lock(&http->mtx);
 	http_rd_submit(http, aio);
@@ -411,7 +497,7 @@ nni_http_write_req(nni_http *http, nni_http_req *req, nni_aio *aio)
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
-	aio->a_prov_extra     = req;
+	aio->a_prov_extra[0]  = req;
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;
@@ -422,17 +508,17 @@ nni_http_write_req(nni_http *http, nni_http_req *req, nni_aio *aio)
 }
 
 void
-nni_http_write_msg(nni_http *http, nni_http_msg *msg, nni_aio *aio)
+nni_http_write_res(nni_http *http, nni_http_res *res, nni_aio *aio)
 {
 	int    rv;
 	void * buf;
 	size_t bufsz;
 
-	if ((rv = nni_http_msg_get_buf(msg, &buf, &bufsz)) != 0) {
+	if ((rv = nni_http_res_get_buf(res, &buf, &bufsz)) != 0) {
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
-	aio->a_prov_extra     = msg;
+	aio->a_prov_extra[0]  = res;
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;

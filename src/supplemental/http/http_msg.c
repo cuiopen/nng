@@ -27,49 +27,31 @@ typedef struct http_header {
 	nni_list_node node;
 } http_header;
 
-typedef struct http_entity {
+struct nni_http_entity {
 	char * data;
 	size_t size; // allocated/expected size
 	size_t len;  // current length
 	bool   own;  // if true, data is "ours", and should be freed
-} http_entity;
-
-typedef enum { HTTP_MSG_REQUEST, HTTP_MSG_RESPONSE } http_msgtype;
-
-typedef struct nni_http_msg {
-	http_msgtype type;
-	int          code;
-	char *       meth;
-	char *       vers;
-	char *       uri;
-	char *       rsn;
-	nni_list     hdrs;
-	char *       buf;
-	size_t       bufsz;
-	char *       data;
-	size_t       datasz;
-	bool         freedata; // if true free data when the message is freed
-	size_t       datawidx;
-} http_msg;
+};
 
 struct nni_http_req {
-	nni_list    hdrs;
-	http_entity data;
-	char *      meth;
-	char *      uri;
-	char *      vers;
-	char *      buf;
-	size_t      bufsz;
+	nni_list        hdrs;
+	nni_http_entity data;
+	char *          meth;
+	char *          uri;
+	char *          vers;
+	char *          buf;
+	size_t          bufsz;
 };
 
 struct nni_http_res {
-	nni_list    hdrs;
-	http_entity data;
-	int         code;
-	char *      rsn;
-	char *      vers;
-	char *      buf;
-	size_t      bufsz;
+	nni_list        hdrs;
+	nni_http_entity data;
+	int             code;
+	char *          rsn;
+	char *          vers;
+	char *          buf;
+	size_t          bufsz;
 };
 
 static int
@@ -101,7 +83,7 @@ http_headers_reset(nni_list *hdrs)
 }
 
 static void
-http_entity_reset(http_entity *entity)
+http_entity_reset(nni_http_entity *entity)
 {
 	if (entity->own && entity->size) {
 		nni_free(entity->data, entity->size);
@@ -310,7 +292,7 @@ nni_http_res_get_header(nni_http_res *res, const char *key)
 // http_entity_set_data sets the entity, but does not update the
 // content-length header.
 static void
-http_entity_set_data(http_entity *entity, const void *data, size_t size)
+http_entity_set_data(nni_http_entity *entity, const void *data, size_t size)
 {
 	if (entity->own) {
 		nni_free(entity->data, entity->size);
@@ -321,7 +303,7 @@ http_entity_set_data(http_entity *entity, const void *data, size_t size)
 }
 
 static int
-http_entity_copy_data(http_entity *entity, const void *data, size_t size)
+http_entity_alloc_data(nni_http_entity *entity, size_t size)
 {
 	void *newdata;
 	if ((newdata = nni_alloc(size)) == NULL) {
@@ -333,7 +315,17 @@ http_entity_copy_data(http_entity *entity, const void *data, size_t size)
 }
 
 static int
-http_set_content_length(http_entity *entity, nni_list *hdrs)
+http_entity_copy_data(nni_http_entity *entity, const void *data, size_t size)
+{
+	int rv;
+	if ((rv = http_entity_alloc_data(entity, size)) == 0) {
+		memcpy(entity->data, data, size);
+	}
+	return (rv);
+}
+
+static int
+http_set_content_length(nni_http_entity *entity, nni_list *hdrs)
 {
 	char buf[16];
 	(void) snprintf(buf, sizeof(buf), "%u", (unsigned) entity->size);
@@ -341,7 +333,7 @@ http_set_content_length(http_entity *entity, nni_list *hdrs)
 }
 
 static void
-http_entity_get_data(http_entity *entity, void **datap, size_t *sizep)
+http_entity_get_data(nni_http_entity *entity, void **datap, size_t *sizep)
 {
 	*datap = entity->data;
 	*sizep = entity->size;
@@ -390,8 +382,14 @@ nni_http_res_copy_data(nni_http_res *res, const void *data, size_t size)
 	return (0);
 }
 
+int
+nni_http_res_alloc_data(nni_http_res *res, size_t size)
+{
+	return (http_entity_alloc_data(&res->data, size));
+}
+
 static int
-http_parse_header(nni_list *hdrs, char *line)
+http_parse_header(nni_list *hdrs, void *line)
 {
 	http_header *h;
 	char *       key = line;
@@ -532,41 +530,6 @@ nni_http_res_get_buf(nni_http_res *res, void **data, size_t *szp)
 	return (0);
 }
 
-// parse the response.  Note that this is destructive to the line.
-static int
-http_msg_parse_res(nni_http_msg *msg, char *line)
-{
-	int   rv;
-	char *reason;
-	char *codestr;
-	char *version;
-	int   status;
-
-	version = line;
-	if ((codestr = strchr(version, ' ')) == NULL) {
-		return (NNG_EPROTO);
-	}
-	*codestr = '\0';
-	codestr++;
-
-	if ((reason = strchr(codestr, ' ')) == NULL) {
-		return (NNG_EPROTO);
-	}
-	*reason = '\0';
-	reason++;
-
-	status = atoi(codestr);
-	if ((status < 100) || (status > 999)) {
-		return (NNG_EPROTO);
-	}
-
-	if (((rv = nni_http_msg_set_status(msg, status, reason)) != 0) ||
-	    ((rv = nni_http_msg_set_version(msg, version)) != 0)) {
-		return (rv);
-	}
-	return (0);
-}
-
 int
 nni_http_req_init(nni_http_req **reqp)
 {
@@ -659,7 +622,7 @@ int
 nni_http_res_set_status(nni_http_res *res, int status, const char *reason)
 {
 	int rv;
-	if ((rv = http_set_string(&res->rsn, reason)) != 0) {
+	if ((rv = http_set_string(&res->rsn, reason)) == 0) {
 		res->code = status;
 	}
 	return (rv);
@@ -678,10 +641,11 @@ nni_http_res_get_reason(nni_http_res *res)
 }
 
 static int
-http_scan_line(char *buf, size_t n, size_t *lenp)
+http_scan_line(void *vbuf, size_t n, size_t *lenp)
 {
 	size_t len;
 	char   c, lc;
+	char * buf = vbuf;
 
 	lc = 0;
 	for (len = 0; len < n; len++) {
@@ -706,25 +670,7 @@ http_scan_line(char *buf, size_t n, size_t *lenp)
 }
 
 static int
-http_entity_parse(http_entity *entity, char *buf, size_t n, size_t *lenp)
-{
-	size_t cnt = 0;
-	int    rv  = 0;
-	if (entity->size) {
-		cnt = entity->size - entity->len;
-		if (cnt > n) { // We need more than is available.
-			cnt = n;
-			rv  = NNG_EAGAIN;
-		}
-		memcpy(entity->data + entity->len, buf, cnt);
-		entity->len += cnt;
-	}
-	*lenp = cnt;
-	return (rv);
-}
-
-static int
-http_req_parse_line(nni_http_req *req, char *line)
+http_req_parse_line(nni_http_req *req, void *line)
 {
 	int   rv;
 	char *method;
@@ -752,21 +698,55 @@ http_req_parse_line(nni_http_req *req, char *line)
 	return (0);
 }
 
+static int
+http_res_parse_line(nni_http_res *res, uint8_t *line)
+{
+	int   rv;
+	char *reason;
+	char *codestr;
+	char *version;
+	int   status;
+
+	version = (char *) line;
+	if ((codestr = strchr(version, ' ')) == NULL) {
+		return (NNG_EPROTO);
+	}
+	*codestr = '\0';
+	codestr++;
+
+	if ((reason = strchr(codestr, ' ')) == NULL) {
+		return (NNG_EPROTO);
+	}
+	*reason = '\0';
+	reason++;
+
+	status = atoi(codestr);
+	if ((status < 100) || (status > 999)) {
+		return (NNG_EPROTO);
+	}
+
+	if (((rv = nni_http_res_set_status(res, status, reason)) != 0) ||
+	    ((rv = nni_http_res_set_version(res, version)) != 0)) {
+		return (rv);
+	}
+	return (0);
+}
+
+// nni_http_req_parse parses a request (but not any attached entity data).
+// The amount of data consumed is returned in lenp.  Returns zero on
+// success, NNG_EPROTO on parse failure, NNG_EAGAIN if more data is
+// required, or NNG_ENOMEM on memory exhaustion.  Note that lenp may
+// be updated even in the face of errors (esp. NNG_EAGAIN, which is
+// not an error so much as a request for more data.)
 int
-http_req_parse(nni_http_req *req, char *buf, size_t n, size_t *lenp, bool dat)
+nni_http_req_parse(nni_http_req *req, void *buf, size_t n, size_t *lenp)
 {
 
-	size_t len = 0;
-	size_t cnt;
-	char * line;
-	int    rv = 0;
+	size_t   len = 0;
+	size_t   cnt;
+	uint8_t *line;
+	int      rv = 0;
 	for (;;) {
-		if (req->data.size) {
-			rv = http_entity_parse(&req->data, buf, n, &cnt);
-			len += cnt;
-			break;
-		}
-
 		if ((rv = http_scan_line(buf, n, &cnt)) != 0) {
 			break;
 		}
@@ -776,27 +756,8 @@ http_req_parse(nni_http_req *req, char *buf, size_t n, size_t *lenp, bool dat)
 		buf += cnt;
 		n -= cnt;
 
-		// If that is the end of the headers, then start scanning
-		// for data, if the caller asked us to, and it's an HTTP/1.1
-		// request.
 		if (*line == '\0') {
-			const char *cls;
-			int         clen;
-			if ((!dat) || (strcmp(req->vers, "HTTP/1.1") != 0)) {
-				break;
-			}
-			cls = http_get_header(&req->hdrs, "Content-Length");
-			if ((cls == NULL) || ((clen = atoi(cls)) < 1)) {
-				break;
-			}
-			if ((req->data.data = nni_alloc(clen)) == NULL) {
-				rv = NNG_ENOMEM;
-				break;
-			}
-			req->data.size = (size_t) clen;
-			req->data.len  = 0;
-			req->data.own  = true;
-			continue;
+			break;
 		}
 
 		if (req->vers != NULL) {
@@ -814,27 +775,15 @@ http_req_parse(nni_http_req *req, char *buf, size_t n, size_t *lenp, bool dat)
 	return (rv);
 }
 
-// http_msg_parse parses a message, and optionally the attached entity/data.
-static int
-http_msg_parse(nni_http_msg *msg, char *buf, size_t n, size_t *lenp, bool dat)
+int
+nni_http_res_parse(nni_http_res *res, void *buf, size_t n, size_t *lenp)
 {
-	size_t len = 0;
-	size_t cnt;
-	char * line;
-	int    rv = 0;
-	for (;;) {
-		if (msg->datasz) {
-			cnt = msg->datasz - msg->datawidx;
-			if (cnt > n) { // We need more than is available.
-				cnt = n;
-				rv  = NNG_EAGAIN;
-			}
-			memcpy(msg->data + msg->datawidx, buf, cnt);
-			msg->datawidx += cnt;
-			len += cnt;
-			break;
-		}
 
+	size_t   len = 0;
+	size_t   cnt;
+	uint8_t *line;
+	int      rv = 0;
+	for (;;) {
 		if ((rv = http_scan_line(buf, n, &cnt)) != 0) {
 			break;
 		}
@@ -844,34 +793,14 @@ http_msg_parse(nni_http_msg *msg, char *buf, size_t n, size_t *lenp, bool dat)
 		buf += cnt;
 		n -= cnt;
 
-		// If that is the end of the headers, then start scanning
-		// for data, if the caller asked us to, and it's an HTTP/1.1
-		// request.
 		if (*line == '\0') {
-			const char *cls;
-			int         clen;
-			if ((!dat) || (strcmp(msg->vers, "HTTP/1.1") != 0)) {
-				break;
-			}
-			cls = nni_http_msg_get_header(msg, "Content-Length");
-			if ((cls == NULL) || ((clen = atoi(cls)) < 1)) {
-				break;
-			}
-			if ((msg->data = nni_alloc(clen)) == NULL) {
-				rv = NNG_ENOMEM;
-				break;
-			}
-			msg->datasz   = (size_t) clen;
-			msg->datawidx = 0;
-			msg->freedata = true;
-			continue;
+			break;
 		}
 
-		if (msg->vers != NULL) {
-			rv = http_parse_header(&msg->hdrs, line);
+		if (res->vers != NULL) {
+			rv = http_parse_header(&res->hdrs, line);
 		} else {
-			NNI_ASSERT(msg->type == HTTP_MSG_RESPONSE);
-			rv = http_msg_parse_res(msg, line);
+			rv = http_res_parse_line(res, line);
 		}
 
 		if (rv != 0) {
@@ -881,271 +810,4 @@ http_msg_parse(nni_http_msg *msg, char *buf, size_t n, size_t *lenp, bool dat)
 
 	*lenp = len;
 	return (rv);
-}
-
-// Parse a message from the buffer.  This parses consumes only the headers,
-// leaving any entity remaining.  The caller is responsible for consuming
-// the entity.  This returns 0 if the entire message is parsed, NNG_EAGAIN
-// if more data is needed, or another error (e.g. NNG_EPROTO, NNG_ENOMEM).
-// The number of bytes consumed from the input will be returned in *lenp.
-int
-nni_http_msg_parse(nni_http_msg *msg, char *buf, size_t n, size_t *lenp)
-{
-	return (http_msg_parse(msg, buf, n, lenp, false));
-}
-
-// Parse an entire message, including the entity data.  The entity is
-// parsed provided that the message was an HTTP/1.1 message.  (No support
-// for legacy HTTP/1.0 because that means read-until-close.)  The same
-// calling conventions as nni_http_msg_parse apply otherwise.
-int
-nni_http_msg_parse_data(nni_http_msg *msg, char *buf, size_t n, size_t *lenp)
-{
-	return (http_msg_parse(msg, buf, n, lenp, true));
-}
-
-// OBSOLETE HERE
-
-int
-nni_http_msg_get_status(nni_http_msg *msg)
-{
-	return (msg->code);
-}
-
-const char *
-nni_http_msg_get_reason(nni_http_msg *msg)
-{
-	return (msg->rsn);
-}
-
-const char *
-nni_http_msg_get_version(nni_http_msg *msg)
-{
-	return (msg->vers);
-}
-
-void
-nni_http_msg_reset(nni_http_msg *msg)
-{
-	http_header *h;
-
-	msg->code = 0;
-	nni_strfree(msg->meth);
-	msg->meth = NULL;
-	nni_strfree(msg->vers);
-	msg->vers = NULL;
-	nni_strfree(msg->uri);
-	msg->uri = NULL;
-	nni_strfree(msg->rsn);
-	msg->rsn = NULL;
-	if (msg->freedata && msg->datasz) {
-		nni_free(msg->data, msg->datasz);
-	}
-	msg->data     = NULL;
-	msg->datasz   = 0;
-	msg->freedata = false;
-	while ((h = nni_list_first(&msg->hdrs)) != NULL) {
-		nni_list_remove(&msg->hdrs, h);
-		if (h->name != NULL) {
-			nni_strfree(h->name);
-		}
-		if (h->value != NULL) {
-			nni_free(h->value, strlen(h->value) + 1);
-		}
-		NNI_FREE_STRUCT(h);
-	}
-}
-
-int
-xnni_http_msg_add_header(nni_http_msg *msg, const char *key, const char *val)
-{
-	return (http_add_header(&msg->hdrs, key, val));
-}
-
-int
-nni_http_msg_set_header(nni_http_msg *msg, const char *key, const char *val)
-{
-	return (http_set_header(&msg->hdrs, key, val));
-}
-
-const char *
-nni_http_msg_get_header(nni_http_msg *msg, const char *key)
-{
-	return (http_get_header(&msg->hdrs, key));
-}
-
-static int
-http_msg_init(nni_http_msg **msgp, http_msgtype type)
-{
-	nni_http_msg *msg;
-	if ((msg = NNI_ALLOC_STRUCT(msg)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	msg->type = type;
-	NNI_LIST_INIT(&msg->hdrs, http_header, node);
-	msg->buf    = NULL;
-	msg->bufsz  = 0;
-	msg->data   = NULL;
-	msg->datasz = 0;
-	*msgp       = msg;
-	return (0);
-}
-
-int
-nni_http_msg_init_res(nni_http_msg **msgp)
-{
-	return (http_msg_init(msgp, HTTP_MSG_RESPONSE));
-}
-
-static int
-http_msg_set_data(nni_http_msg *msg, const void *data, size_t sz)
-{
-	int  rv;
-	char buf[16];
-	(void) snprintf(buf, sizeof(buf), "%u", (unsigned) sz);
-
-	if ((rv = nni_http_msg_set_header(msg, "Content-Length", buf)) != 0) {
-		return (rv);
-	}
-
-	if (msg->freedata) {
-		nni_free(msg->data, msg->datasz);
-	}
-	msg->data     = (void *) data;
-	msg->datasz   = sz;
-	msg->freedata = false;
-	return (0);
-}
-
-int
-nni_http_msg_set_data(nni_http_msg *msg, const void *data, size_t sz)
-{
-	return (http_msg_set_data(msg, data, sz));
-}
-int
-nni_http_msg_copy_data(nni_http_msg *msg, const void *data, size_t sz)
-{
-	int   rv;
-	void *newdata;
-
-	if ((newdata = nni_alloc(sz)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	if ((rv = nni_http_msg_set_data(msg, newdata, sz)) != 0) {
-		nni_free(newdata, sz);
-		return (rv);
-	}
-	msg->freedata = true;
-	return (0);
-}
-
-void
-nni_http_msg_get_data(nni_http_msg *msg, void **datap, size_t *szp)
-{
-	*datap = msg->data;
-	*szp   = msg->datasz;
-}
-
-int
-nni_http_msg_set_status(nni_http_msg *msg, int status, const char *reason)
-{
-	char *news;
-	if ((news = nni_strdup(reason)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	nni_strfree(msg->rsn);
-	msg->rsn  = news;
-	msg->code = status;
-	return (0);
-}
-
-int
-nni_http_msg_set_version(nni_http_msg *msg, const char *vers)
-{
-	char *news;
-	if ((news = nni_strdup(vers)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	nni_strfree(msg->vers);
-	msg->vers = news;
-	return (0);
-}
-
-static int
-http_msg_prepare(nni_http_msg *m)
-{
-	size_t n, len;
-	char * buf;
-	char * vers;
-
-	if ((vers = m->vers) == NULL) {
-		vers = "HTTP/1.1"; // reasonable default
-	}
-
-	switch (m->type) {
-	case HTTP_MSG_REQUEST:
-		if ((m->uri == NULL) || (m->meth == NULL)) {
-			return (NNG_EINVAL);
-		}
-		len = snprintf(NULL, 0, "%s %s %s", m->meth, m->uri, vers);
-		break;
-	case HTTP_MSG_RESPONSE:
-		if (m->rsn == NULL) {
-			return (NNG_EINVAL);
-		}
-		len = snprintf(NULL, 0, "%s %d %s", vers, m->code, m->rsn);
-		break;
-	}
-	len += http_sprintf_headers(NULL, 0, &m->hdrs);
-	len += 5; // \r\n\r\n\0
-
-	if (len <= m->bufsz) {
-		buf = m->buf;
-	} else {
-		if ((buf = nni_alloc(len)) == NULL) {
-			return (NNG_ENOMEM);
-		}
-		nni_free(m->buf, m->bufsz);
-		m->buf   = buf;
-		m->bufsz = len;
-	}
-	switch (m->type) {
-	case HTTP_MSG_REQUEST:
-		n = snprintf(buf, len, "%s %s %s\r\n", m->meth, m->uri, vers);
-		break;
-	case HTTP_MSG_RESPONSE:
-		n = snprintf(buf, len, "%s %d %s\r\n", vers, m->code, m->rsn);
-		break;
-	}
-	buf += n;
-	len -= n;
-	n = http_sprintf_headers(buf, len, &m->hdrs);
-	buf += n;
-	len -= n;
-	snprintf(buf, len, "\r\n");
-	return (0);
-}
-
-int
-nni_http_msg_get_buf(nni_http_msg *msg, void **data, size_t *szp)
-{
-	int rv;
-
-	if ((msg->buf == NULL) && (rv = http_msg_prepare(msg)) != 0) {
-		return (rv);
-	}
-	*data = msg->buf;
-	*szp  = strlen(msg->buf);
-	return (0);
-}
-void
-nni_http_msg_fini(nni_http_msg *msg)
-{
-	http_header *h;
-
-	nni_http_msg_reset(msg);
-	if (msg->bufsz) {
-		nni_free(msg->buf, msg->bufsz);
-	}
-	NNI_FREE_STRUCT(msg);
 }
