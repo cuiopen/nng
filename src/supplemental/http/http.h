@@ -154,6 +154,7 @@ extern void nni_http_read_res(nni_http *, nni_http_res *, nni_aio *);
 extern void nni_http_read(nni_http *, nni_aio *);
 extern void nni_http_read_full(nni_http *, nni_aio *);
 extern void nni_http_write(nni_http *, nni_aio *);
+extern void nni_http_write_full(nni_http *, nni_aio *);
 
 // An HTTP client works like an HTTP channel, but it has the logic to
 // establish the connection, etc.  At present no connection caching is

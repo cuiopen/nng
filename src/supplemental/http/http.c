@@ -19,22 +19,24 @@
 #define HTTP_BUFSIZE 8192
 
 // types of reads
-#if 0
-#define HTTP_RD_RAW ((void *) 0)  // raw read - may return partial read
-#define HTTP_RD_REQ ((void *) 1)  // resquest located in prov_extra[1]
-#define HTTP_RD_RES ((void *) 2)  // response located in prov_extra[1]
-#define HTTP_RD_FULL ((void *) 3) // resid located in prov_extra[1]
-#endif
-
 enum read_flavor {
 	HTTP_RD_RAW,
+	HTTP_RD_FULL,
 	HTTP_RD_REQ,
 	HTTP_RD_RES,
-	HTTP_RD_FULL,
+};
+
+enum write_flavor {
+	HTTP_WR_RAW,
+	HTTP_WR_FULL,
+	HTTP_WR_REQ,
+	HTTP_WR_RES,
 };
 
 #define SET_RD_FLAVOR(aio, f) (aio)->a_prov_extra[0] = ((void *) (intptr_t)(f))
 #define GET_RD_FLAVOR(aio) (int) ((intptr_t) aio->a_prov_extra[0])
+#define SET_WR_FLAVOR(aio, f) (aio)->a_prov_extra[0] = ((void *) (intptr_t)(f))
+#define GET_WR_FLAVOR(aio) (int) ((intptr_t) aio->a_prov_extra[0])
 
 struct nni_http {
 	void *sock;
@@ -96,11 +98,6 @@ nni_http_close(nni_http *http)
 }
 
 // http_rd_buf attempts to satisfy the read from data in the buffer.
-// It can return the following:
-//
-//  0: read satisfied.
-//  NNG_EAGAIN: read partially satisfied - retrying automatically
-// XXX: read
 static int
 http_rd_buf(nni_http *http, nni_aio *aio)
 {
@@ -330,20 +327,12 @@ http_wr_start(nni_http *http)
 {
 	nni_aio *aio;
 
-	if (http->closed) {
-		while ((aio = nni_list_first(&http->wrq)) != NULL) {
-			nni_aio_list_remove(aio);
-			nni_aio_finish_error(aio, NNG_ECLOSED);
-		}
-		return;
-	}
-
 	if ((aio = nni_list_first(&http->wrq)) != NULL) {
-		http->wr_aio->a_niov = aio->a_niov;
+
 		for (int i = 0; i < aio->a_niov; i++) {
 			http->wr_aio->a_iov[i] = aio->a_iov[i];
 		}
-		// Submit it down for completion.
+		http->wr_aio->a_niov = aio->a_niov;
 		http->wr(http->sock, http->wr_aio);
 	}
 }
@@ -374,13 +363,14 @@ http_wr_cb(void *arg)
 
 	n = nni_aio_count(aio);
 	uaio->a_count += n;
-	if (uaio->a_prov_extra[0] == NULL) {
+	if (GET_WR_FLAVOR(uaio) == HTTP_WR_RAW) {
 		// For raw data, we just send partial completion
 		// notices to the consumer.
 		goto done;
 	}
 	while (n) {
 		NNI_ASSERT(aio->a_niov != 0);
+
 		if (aio->a_iov[0].iov_len > n) {
 			aio->a_iov[0].iov_len -= n;
 			aio->a_iov[0].iov_buf += n;
@@ -497,10 +487,10 @@ nni_http_write_req(nni_http *http, nni_http_req *req, nni_aio *aio)
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
-	aio->a_prov_extra[0]  = req;
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;
+	SET_WR_FLAVOR(aio, HTTP_WR_REQ);
 
 	nni_mtx_lock(&http->mtx);
 	http_wr_submit(http, aio);
@@ -518,10 +508,10 @@ nni_http_write_res(nni_http *http, nni_http_res *res, nni_aio *aio)
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
-	aio->a_prov_extra[0]  = res;
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;
+	SET_WR_FLAVOR(aio, HTTP_WR_RES);
 
 	nni_mtx_lock(&http->mtx);
 	http_wr_submit(http, aio);
@@ -536,6 +526,18 @@ nni_http_write_res(nni_http *http, nni_http_res *res, nni_aio *aio)
 void
 nni_http_write(nni_http *http, nni_aio *aio)
 {
+	SET_WR_FLAVOR(aio, HTTP_WR_RAW);
+
+	nni_mtx_lock(&http->mtx);
+	http_wr_submit(http, aio);
+	nni_mtx_unlock(&http->mtx);
+}
+
+void
+nni_http_write_full(nni_http *http, nni_aio *aio)
+{
+	SET_WR_FLAVOR(aio, HTTP_WR_FULL);
+
 	nni_mtx_lock(&http->mtx);
 	http_wr_submit(http, aio);
 	nni_mtx_unlock(&http->mtx);
