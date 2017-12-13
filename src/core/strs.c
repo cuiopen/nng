@@ -8,6 +8,7 @@
 // found online at https://opensource.org/licenses/MIT.
 //
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -112,5 +113,27 @@ nni_strnlen(const char *s, size_t len)
 		s++;
 	}
 	return (n);
+#endif
+}
+
+char *
+nni_strcasestr(const char *s1, const char *s2)
+{
+#ifdef NNG_HAVE_STRCASESTR
+	return (strcasestr(s1, s2));
+#else
+	const char *t1, *t2;
+	while (*s1) {
+		for (t1 = s1, t2 = s2; *t1 && *t2; t2++, t1++) {
+			if (tolower(*t1) != tolower(*t2)) {
+				break;
+			}
+		}
+		if (*t2 == 0) {
+			return ((char *) s1);
+		}
+		s1++;
+	}
+	return (NULL);
 #endif
 }

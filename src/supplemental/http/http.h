@@ -41,6 +41,7 @@ extern const char *nni_http_req_get_header(nni_http_req *, const char *);
 extern const char *nni_http_req_get_header(nni_http_req *, const char *);
 extern const char *nni_http_req_get_version(nni_http_req *);
 extern const char *nni_http_req_get_uri(nni_http_req *);
+extern const char *nni_http_req_get_method(nni_http_req *);
 extern int nni_http_req_parse(nni_http_req *, void *, size_t, size_t *);
 
 extern int  nni_http_res_init(nni_http_res **);
@@ -50,6 +51,8 @@ extern int  nni_http_res_get_buf(nni_http_res *, void **, size_t *);
 extern int nni_http_res_set_header(nni_http_res *, const char *, const char *);
 extern int nni_http_res_add_header(nni_http_res *, const char *, const char *);
 extern int nni_http_res_del_header(nni_http_res *, const char *);
+extern int nni_http_res_set_version(nni_http_res *, const char *);
+extern int nni_http_res_set_status(nni_http_res *, int, const char *);
 extern const char *nni_http_res_get_header(nni_http_res *, const char *);
 extern const char *nni_http_res_get_version(nni_http_res *);
 extern const char *nni_http_res_get_reason(nni_http_res *);
@@ -190,16 +193,26 @@ typedef struct {
 	// (This restriction may be lifted in the future.)
 	bool h_is_dir;
 
+	// h_is_upgrader is used for callbacks that "upgrade" (or steal)
+	// their connection. When this is true, the server framework
+	// assumes that the handler takes over *all* of the details of
+	// the connection.  Consequently, the connection is disassociated
+	// from the framework, and no response is sent.  (Upgraders are
+	// responsible for adopting the connection, including closing it
+	// when they are done, and for sending any HTTP response message.
+	// This is true even if an error occurs.)
+	bool h_is_upgrader;
+
 	// h_cb is a callback that handles the request.  The conventions
 	// are as follows:
 	//
 	// inputs:
 	//   0 - nni_http * for the actual underlying HTTP channel
-	//   1 - nni_http_msg * for the HTTP request object
+	//   1 - nni_http_req * for the HTTP request object
 	//   2 - void * for the opaque pointer supplied at registration
 	//
 	// outputs:
-	//   0 - (optional) nni_http * for an HTTP response (see below)
+	//   0 - (optional) nni_http_res * for an HTTP response (see below)
 	//
 	// The callback may choose to return the a response object in output 0,
 	// in which case the framework will handle sending the reply.
@@ -213,11 +226,8 @@ typedef struct {
 	// the presence of headers. (It may also call nni_http_read or
 	// nni_http_write on the channel as it sees fit.)
 	//
-	// An "upgrader" that wants to take over complete ownership of the
-	// channel should not call the completion callback until the
-	// channel is closed.  Note that timeouts on replies are automatically
-	// disabled.  (An example of an "upgrader" would be a websocket
-	// implementation.)
+	// Upgraders should call the completion routine immediately,
+	// once they have collected the request object and HTTP channel.
 	void (*h_cb)(nni_aio *);
 } nni_http_handler;
 

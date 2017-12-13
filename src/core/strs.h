@@ -18,5 +18,6 @@ extern void   nni_strfree(char *);
 extern size_t nni_strlcpy(char *, const char *, size_t);
 extern size_t nni_strlcat(char *, const char *, size_t);
 extern size_t nni_strnlen(const char *, size_t);
+extern char * nni_strcasestr(const char *, const char *);
 
 #endif // CORE_STRS_H

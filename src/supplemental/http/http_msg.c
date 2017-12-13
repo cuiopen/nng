@@ -340,13 +340,13 @@ http_entity_get_data(nni_http_entity *entity, void **datap, size_t *sizep)
 }
 
 void
-http_req_get_data(nni_http_req *req, void **datap, size_t *sizep)
+nni_http_req_get_data(nni_http_req *req, void **datap, size_t *sizep)
 {
 	http_entity_get_data(&req->data, datap, sizep);
 }
 
 void
-http_res_get_data(nni_http_res *res, void **datap, size_t *sizep)
+nni_http_res_get_data(nni_http_res *res, void **datap, size_t *sizep)
 {
 	http_entity_get_data(&res->data, datap, sizep);
 }
