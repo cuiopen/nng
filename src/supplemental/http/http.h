@@ -247,16 +247,6 @@ extern int nni_http_server_add_handler(
 
 extern void nni_http_server_del_handler(nni_http_server *, void *);
 
-// The server has its own handlers for certain error conditions.  You can
-// override the handlers for those using the following.  Most commonly this
-// will be to supply a custom 404 page.  Note that unlike a normal handler,
-// it is not possible to override the status code.  Not every error code
-// will be handleable, but many of the 4xx codes are, including especially
-// 404 and 405.  The callback function has the same semantics as the
-// h_cb member of nni_http_handler.
-extern int nni_http_server_set_error_handler(
-    nni_http_server *, int, void (*)(nni_aio *), void *);
-
 // nni_http_server_start starts listening on the supplied port.
 extern int nni_http_server_start(nni_http_server *, nng_sockaddr *);
 
@@ -264,6 +254,25 @@ extern int nni_http_server_start(nni_http_server *, nng_sockaddr *);
 // Connections that have been "upgraded" are unaffected.  Connections
 // associated with a callback will complete their callback, and then close.
 extern void nni_http_server_stop(nni_http_server *);
+
+// nni_http_server_add_static is a short cut to add static
+// content handler to the server.  The host may be NULL, and the
+// ctype (aka Content-Type) may be NULL.  If the Content-Type is NULL,
+// then application/octet stream will be the (probably bad) default.
+// The actual data is copied, and so the caller may discard it once
+// this function returns.
+extern int nni_http_server_add_static(nni_http_server *, const char *host,
+    const char *ctype, const char *uri, const void *, size_t);
+
+// nni_http_server_add file is a short cut to add a file-backed static
+// content handler to the server.  The host may be NULL, and the
+// ctype (aka Content-Type) may be NULL.  If the Content-Type is NULL,
+// then the server will try to guess it based on the filename -- but only
+// a small number of file types are builtin.  URI is the absolute URI
+// (sans hostname and scheme), and the path is the path on the local
+// filesystem where the file can be found.
+extern int nni_http_server_add_file(nni_http_server *, const char *host,
+    const char *ctype, const char *uri, const char *path);
 
 // TLS will use
 // extern int nni_http_server_start_tls(nni_http_server *, nng_sockaddr *,

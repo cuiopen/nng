@@ -354,8 +354,25 @@ nni_http_res_get_data(nni_http_res *res, void **datap, size_t *sizep)
 int
 nni_http_req_set_data(nni_http_req *req, const void *data, size_t size)
 {
+	int rv;
+
 	http_entity_set_data(&req->data, data, size);
-	return (http_set_content_length(&req->data, &req->hdrs));
+	if ((rv = http_set_content_length(&req->data, &req->hdrs)) != 0) {
+		http_entity_set_data(&req->data, NULL, 0);
+	}
+	return (rv);
+}
+
+int
+nni_http_res_set_data(nni_http_res *res, const void *data, size_t size)
+{
+	int rv;
+
+	http_entity_set_data(&res->data, data, size);
+	if ((rv = http_set_content_length(&res->data, &res->hdrs)) != 0) {
+		http_entity_set_data(&res->data, NULL, 0);
+	}
+	return (rv);
 }
 
 int
@@ -365,6 +382,7 @@ nni_http_req_copy_data(nni_http_req *req, const void *data, size_t size)
 
 	if (((rv = http_entity_copy_data(&req->data, data, size)) != 0) ||
 	    ((rv = http_set_content_length(&req->data, &req->hdrs)) != 0)) {
+		http_entity_set_data(&req->data, NULL, 0);
 		return (rv);
 	}
 	return (0);
@@ -377,6 +395,7 @@ nni_http_res_copy_data(nni_http_res *res, const void *data, size_t size)
 
 	if (((rv = http_entity_copy_data(&res->data, data, size)) != 0) ||
 	    ((rv = http_set_content_length(&res->data, &res->hdrs)) != 0)) {
+		http_entity_set_data(&res->data, NULL, 0);
 		return (rv);
 	}
 	return (0);
@@ -651,11 +670,15 @@ http_scan_line(void *vbuf, size_t n, size_t *lenp)
 	for (len = 0; len < n; len++) {
 		c = buf[len];
 		if (c == '\n') {
+			// Technically we should be receiving CRLF, but
+			// debugging is easier with just LF, so we behave
+			// following Postel's Law.
 			if (lc != '\r') {
-				return (NNG_EPROTO);
+				buf[len] = '\0';
+			} else {
+				buf[len - 1] = '\0';
 			}
-			buf[len - 1] = '\0';
-			*lenp        = len + 1;
+			*lenp = len + 1;
 			return (0);
 		}
 		// If we have a control character (other than CR), or a CR

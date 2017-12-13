@@ -22,9 +22,10 @@ typedef struct http_handler {
 	char *        h_path;
 	char *        h_method;
 	char *        h_host;
-	bool          h_upgrader;
+	bool          h_is_upgrader;
 	bool          h_is_dir;
 	void (*h_cb)(nni_aio *);
+	void (*h_free)(void *);
 } http_handler;
 
 typedef struct http_sconn {
@@ -92,14 +93,14 @@ http_sconn_txdatdone(void *arg)
 		return;
 	}
 
-	if (sc->close) {
-		http_sconn_close(sc);
-		return;
-	}
-
 	if (sc->res != NULL) {
 		nni_http_res_fini(sc->res);
 		sc->res = NULL;
+	}
+
+	if (sc->close) {
+		http_sconn_close(sc);
+		return;
 	}
 
 	nni_http_req_reset(sc->req);
@@ -127,7 +128,7 @@ http_sconn_txdone(void *arg)
 	if (strcmp(nni_http_req_get_method(sc->req), "HEAD") == 0) {
 		size = 0;
 	} else {
-		nni_http_res_get_data(sc->res, data, &size);
+		nni_http_res_get_data(sc->res, &data, &size);
 	}
 	if (size) {
 		// Submit data.
@@ -220,13 +221,18 @@ http_uri_canonify(char *path)
 	return (path);
 }
 
-static void
-http_sconn_error(http_sconn *sc, int err)
+static int
+http_make_error(nni_http_res **resp, int err)
 {
 	// XXX: add handling for overrides.
-	char *rsn;
-	char  rsnbuf[80];
-	char  html[1024];
+	char *        rsn;
+	char          rsnbuf[80];
+	char          html[1024];
+	nni_http_res *res;
+
+	if ((nni_http_res_init(&res)) != 0) {
+		return (NNG_ENOMEM);
+	}
 
 	switch (err) {
 	case NNI_HTTP_STATUS_BAD_REQUEST:
@@ -247,6 +253,12 @@ http_sconn_error(http_sconn *sc, int err)
 	case NNI_HTTP_STATUS_NOT_ACCEPTABLE:
 		rsn = "Not acceptable";
 		break;
+	case NNI_HTTP_STATUS_FORBIDDEN:
+		rsn = "Forbidden";
+		break;
+	case NNI_HTTP_STATUS_HTTP_VERSION_NOT_SUPP:
+		rsn = "HTTP version not supported";
+		break;
 	default:
 		snprintf(rsnbuf, sizeof(rsnbuf), "HTTP error code %d", err);
 		rsn = rsnbuf;
@@ -255,8 +267,8 @@ http_sconn_error(http_sconn *sc, int err)
 
 	// very simple builtin error page
 	snprintf(html, sizeof(html),
-	    "<head><title>%d %s<title></head>"
-	    "<body><h1 align=\"center\">"
+	    "<head><title>%d %s</title></head>"
+	    "<body><p/><h1 align=\"center\">"
 	    "<span style=\"font-size: 36px; border-radius: 5px; "
 	    "background-color: black; color: white; padding: 7px; "
 	    "font-family: Arial, sans serif;\">%d</span></h1>"
@@ -265,15 +277,30 @@ http_sconn_error(http_sconn *sc, int err)
 	    "%s</span></p></body>",
 	    err, rsn, err, rsn);
 
-	nni_http_res_set_status(sc->res, err, rsn);
-	nni_http_res_copy_data(sc->res, html, strlen(html));
-	nni_http_res_set_version(sc->res, "HTTP/1.1");
+	nni_http_res_set_status(res, err, rsn);
+	nni_http_res_copy_data(res, html, strlen(html));
+	nni_http_res_set_version(res, "HTTP/1.1");
 	nni_http_res_set_header(
-	    sc->res, "Content-Type", "text/html; charset=UTF-8");
+	    res, "Content-Type", "text/html; charset=UTF-8");
 	// We could set the date, but we don't necessarily have a portable
 	// way to get the time of day.
 
-	nni_http_write_res(sc->http, sc->res, sc->txaio);
+	*resp = res;
+	return (0);
+}
+
+static void
+http_sconn_error(http_sconn *sc, int err)
+{
+	nni_http_res *res;
+
+	if (http_make_error(&res, err) != 0) {
+		http_sconn_close(sc);
+		return;
+	}
+
+	sc->res = res;
+	nni_http_write_res(sc->http, res, sc->txaio);
 }
 
 static void
@@ -399,7 +426,14 @@ http_sconn_rxdone(void *arg)
 	nni_aio_set_input(sc->cbaio, 0, sc->http);
 	nni_aio_set_input(sc->cbaio, 1, sc->req);
 	nni_aio_set_input(sc->cbaio, 2, h->h_arg);
-	h->h_cb(sc->cbaio);
+	nni_aio_set_data(sc->cbaio, 1, h);
+
+	// Technically, probably callback should initialize this with
+	// start, but we do it instead.
+
+	if (nni_aio_start(sc->cbaio, NULL, NULL) == 0) {
+		h->h_cb(sc->cbaio);
+	}
 }
 
 static void
@@ -408,6 +442,7 @@ http_sconn_cbdone(void *arg)
 	http_sconn *  sc  = arg;
 	nni_aio *     aio = sc->cbaio;
 	nni_http_res *res;
+	http_handler *h;
 
 	if (nni_aio_result(aio) != 0) {
 		// Hard close, no further feedback.
@@ -415,6 +450,14 @@ http_sconn_cbdone(void *arg)
 		return;
 	}
 
+	h = nni_aio_get_data(aio, 1);
+	if (h->h_is_upgrader) {
+		sc->http = NULL;
+		// This isn't a real close, because the HTTP channel
+		// is done.  But it does free up our resources.
+		http_sconn_close(sc);
+		return;
+	}
 	res = nni_aio_get_output(aio, 0);
 	if (res != NULL) {
 
@@ -494,6 +537,7 @@ http_server_acccb(void *arg)
 	if (s->closed) {
 		http_sconn_close(sc);
 	} else {
+		sc->server = s;
 		nni_list_append(&s->conns, sc);
 		nni_http_read_req(sc->http, sc->req, sc->rxaio);
 		nni_plat_tcp_ep_accept(s->tep, s->accaio);
@@ -533,7 +577,10 @@ nni_http_server_init(nni_http_server **serverp)
 int
 nni_http_server_start(nni_http_server *s, nng_sockaddr *addr)
 {
-	int rv;
+	int          rv;
+	nng_sockaddr unspec;
+
+	unspec.s_un.s_family = NNG_AF_UNSPEC;
 
 	s->addr = *addr;
 	rv = nni_plat_tcp_ep_init(&s->tep, &s->addr, NULL, NNI_EP_MODE_LISTEN);
@@ -546,6 +593,7 @@ nni_http_server_start(nni_http_server *s, nng_sockaddr *addr)
 		return (rv);
 	}
 	nni_plat_tcp_ep_accept(s->tep, s->accaio);
+	return (0);
 }
 
 void
@@ -561,7 +609,9 @@ nni_http_server_stop(nni_http_server *s)
 
 	s->closed = true;
 	// Close the TCP endpoint that is listening.
-	nni_plat_tcp_ep_close(s->tep);
+	if (s->tep) {
+		nni_plat_tcp_ep_close(s->tep);
+	}
 
 	// This marks the server as "shutting down" -- existing
 	// connections finish their activity and close.
@@ -585,8 +635,8 @@ http_handler_fini(http_handler *h)
 }
 
 int
-nni_http_server_add_handler(
-    void **hp, nni_http_server *s, nni_http_handler *hh, void *arg)
+http_server_add_handler(void **hp, nni_http_server *s, nni_http_handler *hh,
+    void *arg, void (*freeit)(void *))
 {
 	http_handler *h, *h2;
 	size_t        l1, l2;
@@ -601,9 +651,11 @@ nni_http_server_add_handler(
 	if ((h = NNI_ALLOC_STRUCT(h)) == NULL) {
 		return (NNG_ENOMEM);
 	}
-	h->h_arg    = arg;
-	h->h_cb     = hh->h_cb;
-	h->h_is_dir = hh->h_is_dir;
+	h->h_arg         = arg;
+	h->h_cb          = hh->h_cb;
+	h->h_is_dir      = hh->h_is_dir;
+	h->h_is_upgrader = hh->h_is_upgrader;
+	h->h_free        = freeit;
 
 	if ((hh->h_host != NULL) &&
 	    ((h->h_host = nni_strdup(hh->h_host)) == NULL)) {
@@ -631,7 +683,7 @@ nni_http_server_add_handler(
 	// General rule for finding a conflict is that if either string
 	// is a strict substring of the other, then we have a
 	// collision.  (But only if the methods match, and the host
-	// matches.  Note that a wild card host matches both.
+	// matches.)  Note that a wild card host matches both.
 	NNI_LIST_FOREACH (&s->handlers, h2) {
 		if ((h2->h_host != NULL) && (h->h_host != NULL) &&
 		    (strcasecmp(h2->h_host, h->h_host) != 0)) {
@@ -654,6 +706,253 @@ nni_http_server_add_handler(
 	}
 	nni_list_append(&s->handlers, h);
 	nni_mtx_unlock(&s->mtx);
-	*hp = h;
+	if (hp != NULL) {
+		*hp = h;
+	}
+	return (0);
+}
+
+int
+nni_http_server_add_handler(
+    void **hp, nni_http_server *s, nni_http_handler *hh, void *arg)
+{
+	return (http_server_add_handler(hp, s, hh, arg, NULL));
+}
+
+void
+nni_http_del_handler(nni_http_server *s, void *harg)
+{
+	http_handler *h = harg;
+
+	nni_mtx_lock(&s->mtx);
+	nni_list_node_remove(&h->node);
+	nni_mtx_unlock(&s->mtx);
+
+	http_handler_fini(h);
+}
+
+// Very limited MIME type map.  Used only if the handler does not supply
+// it's own.
+static struct content_map {
+	const char *ext;
+	const char *typ;
+} content_map[] = {
+	// clang-format off
+	{ ".ai", "application/postscript" },
+	{ ".aif", "audio/aiff" },
+	{ ".aiff", "audio/aiff" },
+	{ ".avi", "video/avi" },
+	{ ".au", "audio/basic" },
+	{ ".bin", "application/octet-stream" },
+	{ ".bmp", "image/bmp" },
+	{ ".css", "text/css" },
+	{ ".eps", "application/postscript" },
+	{ ".gif", "image/gif" },
+	{ ".htm", "text/html" },
+	{ ".html", "text/html" },
+	{ ".ico", "image/x-icon" },
+	{ ".jpeg", "image/jpeg" },
+	{ ".jpg", "image/jpeg" },
+	{ ".js", "application/javascript" },
+	{ ".md", "text/markdown" },
+	{ ".mp2", "video/mpeg" },
+	{ ".mp3", "audio/mpeg3" },
+	{ ".mpeg", "video/mpeg" },
+	{ ".mpg", "video/mpeg" },
+	{ ".pdf", "application/pdf" },
+	{ ".png", "image/png" },
+	{ ".ps", "application/postscript" },
+	{ ".rtf", "text/rtf" },
+	{ ".text", "text/plain" },
+	{ ".tif", "image/tiff" },
+	{ ".tiff", "image/tiff" },
+	{ ".txt", "text/plain" },
+	{ ".wav", "audio/wav"},
+	{ "README", "text/plain" },
+	{ NULL, NULL },
+	// clang-format on
+};
+
+const char *
+http_lookup_type(const char *path)
+{
+	size_t l1 = strlen(path);
+	size_t l2;
+	for (int i = 0; content_map[i].ext != NULL; i++) {
+		l2 = strlen(content_map[i].ext);
+		if (l2 > l1) {
+			continue;
+		}
+		if (strcasecmp(&path[l1 - l2], content_map[i].ext) == 0) {
+			return (content_map[i].typ);
+		}
+	}
+	return (NULL);
+}
+
+typedef struct http_file {
+	char *typ;
+	char *pth;
+} http_file;
+
+static void
+http_handle_file(nni_aio *aio)
+{
+	http_file *   f   = nni_aio_get_input(aio, 2);
+	nni_http_res *res = NULL;
+	void *        data;
+	size_t        size;
+	int           status;
+	int           rv;
+
+	if ((rv = nni_plat_file_get(f->pth, &data, &size)) != 0) {
+		switch (rv) {
+		case NNG_ENOMEM:
+			status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+			break;
+		case NNG_ENOENT:
+			status = NNI_HTTP_STATUS_NOT_FOUND;
+			break;
+		case NNG_EPERM:
+			status = NNI_HTTP_STATUS_FORBIDDEN;
+			break;
+		default:
+			status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+			break;
+		}
+		if ((rv = http_make_error(&res, status)) != 0) {
+			nni_aio_finish_error(aio, rv);
+			return;
+		}
+	} else {
+		if (((rv = nni_http_res_init(&res)) != 0) ||
+		    ((rv = nni_http_res_set_status(
+		          res, NNI_HTTP_STATUS_OK, "OK")) != 0) ||
+		    ((rv = nni_http_res_set_header(
+		          res, "Content-Type", f->typ)) != 0) ||
+		    ((rv = nni_http_res_set_data(res, data, size)) != 0)) {
+			nni_free(data, size);
+			nni_aio_finish_error(aio, rv);
+			return;
+		}
+	}
+	nni_aio_set_output(aio, 0, res);
+	nni_aio_finish(aio, 0, 0);
+}
+
+static void
+http_free_file(void *arg)
+{
+	http_file *f = arg;
+	nni_strfree(f->pth);
+	nni_strfree(f->typ);
+	NNI_FREE_STRUCT(f);
+}
+
+int
+nni_http_server_add_file(nni_http_server *s, const char *host,
+    const char *ctype, const char *uri, const char *path)
+{
+	nni_http_handler h;
+	http_file *      f;
+	int              rv;
+
+	if ((f = NNI_ALLOC_STRUCT(f)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+	if (ctype == NULL) {
+		ctype = http_lookup_type(path);
+	}
+
+	if (((f->pth = nni_strdup(path)) == NULL) ||
+	    ((ctype != NULL) && ((f->typ = nni_strdup(ctype)) == NULL))) {
+		http_free_file(f);
+		return (NNG_ENOMEM);
+	}
+	h.h_method      = "GET";
+	h.h_path        = uri;
+	h.h_host        = host;
+	h.h_cb          = http_handle_file;
+	h.h_is_dir      = false;
+	h.h_is_upgrader = false;
+
+	if ((rv = http_server_add_handler(NULL, s, &h, f, http_free_file)) !=
+	    0) {
+		http_free_file(f);
+		return (rv);
+	}
+	return (0);
+}
+
+typedef struct http_static {
+	char * typ;
+	void * data;
+	size_t size;
+} http_static;
+
+static void
+http_handle_static(nni_aio *aio)
+{
+	http_static * s = nni_aio_get_input(aio, 2);
+	nni_http_res *r = NULL;
+	int           rv;
+
+	if (((rv = nni_http_res_init(&r)) != 0) ||
+	    ((rv = nni_http_res_set_header(r, "Content-Type", s->typ)) != 0) ||
+	    ((rv = nni_http_res_set_status(r, NNI_HTTP_STATUS_OK, "OK")) !=
+	        0) ||
+	    ((rv = nni_http_res_set_data(r, s->data, s->size)) != 0)) {
+		nni_aio_finish_error(aio, rv);
+		return;
+	}
+
+	nni_aio_set_output(aio, 0, r);
+	nni_aio_finish(aio, 0, 0);
+}
+
+static void
+http_free_static(void *arg)
+{
+	http_static *s = arg;
+	nni_strfree(s->typ);
+	nni_free(s->data, s->size);
+	NNI_FREE_STRUCT(s);
+}
+
+int
+nni_http_server_add_static(nni_http_server *s, const char *host,
+    const char *ctype, const char *uri, const void *data, size_t size)
+{
+	nni_http_handler h;
+	http_static *    f;
+	int              rv;
+
+	if ((f = NNI_ALLOC_STRUCT(f)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+	if (ctype == NULL) {
+		ctype = "application/octet-stream";
+	}
+	if (((f->data = nni_alloc(size)) == NULL) ||
+	    ((f->typ = nni_strdup(ctype)) == NULL)) {
+		http_free_static(f);
+		return (NNG_ENOMEM);
+	}
+
+	f->size = size;
+	memcpy(f->data, data, size);
+
+	h.h_method      = "GET";
+	h.h_path        = uri;
+	h.h_host        = host;
+	h.h_cb          = http_handle_static;
+	h.h_is_dir      = false;
+	h.h_is_upgrader = false;
+
+	if ((rv = http_server_add_handler(NULL, s, &h, f, http_free_static)) !=
+	    0) {
+		http_free_static(f);
+		return (rv);
+	}
 	return (0);
 }
