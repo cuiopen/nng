@@ -85,21 +85,62 @@ TestMain("HTTP Client", {
 				nni_http_res_fini(res);
 			});
 
-			So(nni_http_req_set_method(req, "GET") == 0);
-			So(nni_http_req_set_version(req, "HTTP/1.1") == 0);
-			So(nni_http_req_set_uri(req, "/bogus") == 0);
-			So(nni_http_req_set_header(req, "Host", "localhost") ==
-			    0);
-			nni_http_write_req(h, req, aio);
+			Convey("404 works", {
+				So(nni_http_req_set_method(req, "GET") == 0);
+				So(nni_http_req_set_version(req, "HTTP/1.1") ==
+				    0);
+				So(nni_http_req_set_uri(req, "/bogus") == 0);
+				So(nni_http_req_set_header(
+				       req, "Host", "localhost") == 0);
+				nni_http_write_req(h, req, aio);
 
-			nni_aio_wait(aio);
-			So(nni_aio_result(aio) == 0);
+				nni_aio_wait(aio);
+				So(nni_aio_result(aio) == 0);
 
-			nni_http_read_res(h, res, aio);
-			nni_aio_wait(aio);
-			So(nni_aio_result(aio) == 0);
+				nni_http_read_res(h, res, aio);
+				nni_aio_wait(aio);
+				So(nni_aio_result(aio) == 0);
 
-			So(nni_http_res_get_status(res) == 404);
+				So(nni_http_res_get_status(res) == 404);
+			});
+
+			Convey("Valid data works", {
+				char        chunk[256];
+				const void *ptr;
+
+				So(nni_http_req_set_method(req, "GET") == 0);
+				So(nni_http_req_set_version(req, "HTTP/1.1") ==
+				    0);
+				So(nni_http_req_set_uri(req, "/home.html") ==
+				    0);
+				So(nni_http_req_set_header(
+				       req, "Host", "localhost") == 0);
+				nni_http_write_req(h, req, aio);
+
+				nni_aio_wait(aio);
+				So(nni_aio_result(aio) == 0);
+
+				nni_http_read_res(h, res, aio);
+				nni_aio_wait(aio);
+				So(nni_aio_result(aio) == 0);
+
+				So(nni_http_res_get_status(res) == 200);
+
+				ptr = nni_http_res_get_header(
+				    res, "Content-Length");
+				So(ptr != NULL);
+				So(atoi(ptr) == strlen(doc));
+
+				aio->a_niov           = 1;
+				aio->a_iov[0].iov_len = strlen(doc);
+				aio->a_iov[0].iov_buf = chunk;
+				nni_http_read_full(h, aio);
+				nni_aio_wait(aio);
+				So(nni_aio_result(aio) == 0);
+				So(nni_aio_count(aio) == strlen(doc));
+				So(memcmp(chunk, doc, strlen(doc)) == 0);
+			});
+
 		});
 	});
 });
