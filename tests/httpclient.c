@@ -35,9 +35,8 @@ TestMain("HTTP Client", {
 		nng_aio *          aio;
 		nni_aio *          iaio;
 		nng_sockaddr       rsa;
-		nng_sockaddr       lsa;
-
-		lsa.s_un.s_family = NNG_AF_UNSPEC;
+		nni_http_client *  cli;
+		nni_http *         http;
 
 		So(nng_aio_alloc(&aio, NULL, NULL) == 0);
 		iaio         = (nni_aio *) aio;
@@ -49,30 +48,20 @@ TestMain("HTTP Client", {
 		So(nng_aio_result(aio) == 0);
 		So(rsa.s_un.s_in.sa_port == htons(80));
 
-		So(nni_plat_tcp_ep_init(&ep, &lsa, &rsa, NNI_EP_MODE_DIAL) ==
-		    0);
-		nni_plat_tcp_ep_connect(ep, iaio);
+		So(nni_http_client_init(&cli, &rsa) == 0);
+		nni_http_client_connect(cli, iaio);
 		nng_aio_wait(aio);
 		So(nng_aio_result(aio) == 0);
-		p = nni_aio_get_pipe(iaio);
-		So(p != NULL);
+		http = nni_aio_get_output(iaio, 0);
 		Reset({
-			nni_plat_tcp_ep_fini(ep);
-			nni_plat_tcp_pipe_fini(p);
+			nni_http_client_fini(cli);
+			nni_http_fini(http);
+			nng_aio_free(aio);
 		});
 
 		Convey("We can initiate a message", {
-			nni_http *    http;
 			nni_http_req *req;
 			nni_http_res *res;
-			nni_http_tran t;
-
-			t.h_data  = p;
-			t.h_write = (void *) nni_plat_tcp_pipe_send;
-			t.h_read  = (void *) nni_plat_tcp_pipe_recv;
-			t.h_close = (void *) nni_plat_tcp_pipe_close;
-
-			So(nni_http_init(&http, &t) == 0);
 			So(http != NULL);
 
 			So(nni_http_req_init(&req) == 0);

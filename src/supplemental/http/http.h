@@ -23,6 +23,7 @@ typedef struct nni_http_tran {
 	void (*h_read)(void *, nni_aio *);
 	void (*h_write)(void *, nni_aio *);
 	void (*h_close)(void *);
+	void (*h_fini)(void *);
 } nni_http_tran;
 
 typedef struct nni_http_req nni_http_req;
@@ -159,13 +160,6 @@ extern void nni_http_read_full(nni_http *, nni_aio *);
 extern void nni_http_write(nni_http *, nni_aio *);
 extern void nni_http_write_full(nni_http *, nni_aio *);
 
-// An HTTP client works like an HTTP channel, but it has the logic to
-// establish the connection, etc.  At present no connection caching is
-// used, but that can change in the future.
-typedef struct nni_http_client nni_http_client;
-
-extern int nni_http_client_init(nni_http_client *, const char *);
-
 typedef struct nni_http_server nni_http_server;
 
 typedef struct {
@@ -277,5 +271,13 @@ extern int nni_http_server_add_file(nni_http_server *, const char *host,
 // TLS will use
 // extern int nni_http_server_start_tls(nni_http_server *, nng_sockaddr *,
 //     nni_tls_config *);
+
+// Client stuff.
+
+typedef struct nni_http_client nni_http_client;
+
+extern int  nni_http_client_init(nni_http_client **, nng_sockaddr *);
+extern void nni_http_client_fini(nni_http_client *);
+extern void nni_http_client_connect(nni_http_client *, nni_aio *);
 
 #endif // NNG_SUPPLEMENTAL_HTTP_HTTP_H

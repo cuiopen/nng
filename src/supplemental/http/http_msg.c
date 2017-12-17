@@ -12,7 +12,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <strings.h>
+#include <string.h>
 
 #include "core/nng_impl.h"
 #include "http.h"
@@ -113,6 +113,7 @@ nni_http_res_reset(nni_http_res *res)
 	http_headers_reset(&res->hdrs);
 	http_entity_reset(&res->data);
 	nni_strfree(res->rsn);
+	nni_strfree(res->vers);
 	res->code = 0;
 	if (res->bufsz) {
 		res->buf[0] = '\0';

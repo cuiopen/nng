@@ -12,5 +12,6 @@ set(HTTP_SOURCES
         supplemental/http/http.c
         supplemental/http/http_msg.c
         supplemental/http/server.c
+        supplemental/http/client.c
         supplemental/http/http.h)
 set(NNG_SOURCES ${NNG_SOURCES} ${HTTP_SOURCES} PARENT_SCOPE)

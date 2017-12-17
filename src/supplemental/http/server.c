@@ -35,6 +35,8 @@ typedef struct http_sconn {
 	nni_http_req *   req;
 	nni_http_res *   res;
 	bool             close;
+	bool             closed;
+	bool             finished;
 	nni_aio *        cbaio;
 	nni_aio *        rxaio;
 	nni_aio *        txaio;
@@ -46,28 +48,30 @@ struct nni_http_server {
 	nng_sockaddr     addr;
 	nni_list         handlers;
 	nni_list         conns;
+	nni_list         reaps;
 	nni_mtx          mtx;
+	nni_cv           cv;
 	bool             closed;
 	bool             tls;
+	nni_task         cleanup;
 	nni_aio *        accaio;
 	nni_plat_tcp_ep *tep;
 };
 
 static void
-http_sconn_close(http_sconn *sc)
+http_sconn_fini(void *arg)
 {
-	nni_http_server *s;
-	if ((s = sc->server) != NULL) {
-		nni_mtx_lock(&s->mtx);
-		nni_list_node_remove(&sc->node);
-		nni_mtx_unlock(&s->mtx);
-	}
+	http_sconn *sc = arg;
+	NNI_ASSERT(!sc->finished);
+	sc->finished = true;
 	nni_aio_stop(sc->rxaio);
 	nni_aio_stop(sc->txaio);
 	nni_aio_stop(sc->txdataio);
 	nni_aio_stop(sc->cbaio);
-	nni_http_close(sc->http);
-	nni_http_fini(sc->http);
+	if (sc->http != NULL) {
+		nni_http_fini(sc->http);
+		sc->http = NULL;
+	}
 	if (sc->req != NULL) {
 		nni_http_req_fini(sc->req);
 	}
@@ -80,6 +84,32 @@ http_sconn_close(http_sconn *sc)
 	nni_aio_fini(sc->txdataio);
 	nni_aio_fini(sc->cbaio);
 	NNI_FREE_STRUCT(sc);
+}
+
+static void
+http_sconn_close(http_sconn *sc)
+{
+	nni_http_server *s;
+	nni_http *       h;
+	s = sc->server;
+
+	NNI_ASSERT(!sc->finished);
+	nni_mtx_lock(&s->mtx);
+	if (!sc->closed) {
+		sc->closed = true;
+		// Close the underlying transport.
+		if ((h = sc->http) != NULL) {
+			nni_http_close(h);
+		}
+		if (nni_list_node_active(&sc->node)) {
+			nni_list_remove(&s->conns, sc);
+			nni_list_append(&s->reaps, sc);
+		}
+		nni_task_dispatch(&s->cleanup);
+	} else {
+		nni_panic("DOUBLE CLOSE!\n");
+	}
+	nni_mtx_unlock(&s->mtx);
 }
 
 static void
@@ -317,7 +347,7 @@ http_sconn_rxdone(void *arg)
 	size_t           urisz;
 	char *           path;
 	char *           tmp;
-	bool             badmeth;
+	bool             badmeth = false;
 
 	if ((rv = nni_aio_result(aio)) != 0) {
 		http_sconn_close(sc);
@@ -506,7 +536,8 @@ http_sconn_init(http_sconn **scp, nni_plat_tcp_pipe *tcp)
 	sc->tran.h_data  = tcp;
 	sc->tran.h_read  = (void *) nni_plat_tcp_pipe_recv;
 	sc->tran.h_write = (void *) nni_plat_tcp_pipe_send;
-	sc->tran.h_close = (void *) nni_plat_tcp_pipe_fini; // close implied
+	sc->tran.h_close = (void *) nni_plat_tcp_pipe_close; // close implied
+	sc->tran.h_fini  = (void *) nni_plat_tcp_pipe_fini;
 
 	if ((rv = nni_http_init(&sc->http, &sc->tran)) != 0) {
 		http_sconn_close(sc);
@@ -523,33 +554,91 @@ http_server_acccb(void *arg)
 	nni_aio *          aio = s->accaio;
 	nni_plat_tcp_pipe *tcp;
 	http_sconn *       sc;
+	int                rv;
 
-	if (nni_aio_result(aio) != 0) {
-		// XXX: now what?
+	if ((rv = nni_aio_result(aio)) != 0) {
+		if (rv == NNG_ECLOSED) {
+			return;
+		}
+		// try again?
+		nni_plat_tcp_ep_accept(s->tep, s->accaio);
+		return;
 	}
 	tcp = nni_aio_get_pipe(aio);
 	if (http_sconn_init(&sc, tcp) != 0) {
 		nni_plat_tcp_pipe_close(tcp);
 		nni_plat_tcp_pipe_fini(tcp);
+
+		nni_plat_tcp_ep_accept(s->tep, s->accaio);
 		return;
 	}
 	nni_mtx_lock(&s->mtx);
+	sc->server = s;
 	if (s->closed) {
-		http_sconn_close(sc);
-	} else {
-		sc->server = s;
-		nni_list_append(&s->conns, sc);
-		nni_http_read_req(sc->http, sc->req, sc->rxaio);
-		nni_plat_tcp_ep_accept(s->tep, s->accaio);
+		nni_http_close(sc->http);
+		sc->closed = true;
+		nni_list_append(&s->reaps, sc);
+		nni_mtx_unlock(&s->mtx);
+		return;
+	}
+	nni_list_append(&s->conns, sc);
+	nni_mtx_unlock(&s->mtx);
+
+	nni_http_read_req(sc->http, sc->req, sc->rxaio);
+	nni_plat_tcp_ep_accept(s->tep, s->accaio);
+}
+
+static void
+http_server_cleanup(void *arg)
+{
+	nni_http_server *s = arg;
+	http_sconn *     sc;
+	nni_mtx_lock(&s->mtx);
+	while ((sc = nni_list_first(&s->reaps)) != NULL) {
+		nni_list_remove(&s->reaps, sc);
+		nni_mtx_unlock(&s->mtx);
+		http_sconn_fini(sc);
+		nni_mtx_lock(&s->mtx);
+	}
+	if (nni_list_empty(&s->reaps) && nni_list_empty(&s->conns)) {
+		nni_cv_wake(&s->cv);
 	}
 	nni_mtx_unlock(&s->mtx);
+}
+
+static void
+http_handler_fini(http_handler *h)
+{
+	nni_strfree(h->h_path);
+	nni_strfree(h->h_host);
+	nni_strfree(h->h_method);
+	if (h->h_free != NULL) {
+		h->h_free(h->h_arg);
+	}
+	NNI_FREE_STRUCT(h);
 }
 
 void
 nni_http_server_fini(nni_http_server *s)
 {
+	http_handler *h;
+
 	nni_http_server_stop(s);
+	nni_mtx_lock(&s->mtx);
+	while ((!nni_list_empty(&s->conns)) || (!nni_list_empty(&s->reaps))) {
+		nni_cv_wait(&s->cv);
+	}
+	if (s->tep != NULL) {
+		nni_plat_tcp_ep_fini(s->tep);
+	}
+	while ((h = nni_list_first(&s->handlers)) != NULL) {
+		nni_list_remove(&s->handlers, h);
+		http_handler_fini(h);
+	}
+	nni_mtx_unlock(&s->mtx);
+	nni_task_wait(&s->cleanup);
 	nni_aio_fini(s->accaio);
+	nni_cv_fini(&s->cv);
 	nni_mtx_fini(&s->mtx);
 	NNI_FREE_STRUCT(s);
 }
@@ -564,8 +653,11 @@ nni_http_server_init(nni_http_server **serverp)
 		return (NNG_ENOMEM);
 	}
 	nni_mtx_init(&s->mtx);
+	nni_cv_init(&s->cv, &s->mtx);
+	nni_task_init(NULL, &s->cleanup, http_server_cleanup, s);
 	NNI_LIST_INIT(&s->handlers, http_handler, node);
 	NNI_LIST_INIT(&s->conns, http_sconn, node);
+	NNI_LIST_INIT(&s->reaps, http_sconn, node);
 	if ((rv = nni_aio_init(&s->accaio, http_server_acccb, s)) != 0) {
 		nni_http_server_fini(s);
 		return (rv);
@@ -623,15 +715,6 @@ nni_http_server_stop(nni_http_server *s)
 		sc->close = true;
 	}
 	nni_mtx_unlock(&s->mtx);
-}
-
-static void
-http_handler_fini(http_handler *h)
-{
-	nni_strfree(h->h_path);
-	nni_strfree(h->h_host);
-	nni_strfree(h->h_method);
-	NNI_FREE_STRUCT(h);
 }
 
 int

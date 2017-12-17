@@ -43,6 +43,7 @@ struct nni_http {
 	void (*rd)(void *, nni_aio *);
 	void (*wr)(void *, nni_aio *);
 	void (*close)(void *);
+	void (*fini)(void *);
 
 	bool closed;
 
@@ -86,7 +87,9 @@ http_close(nni_http *http)
 		}
 	}
 
-	http->close(http->sock);
+	if (http->sock != NULL) {
+		http->close(http->sock);
+	}
 }
 
 void
@@ -548,6 +551,10 @@ nni_http_fini(nni_http *http)
 {
 	nni_mtx_lock(&http->mtx);
 	http_close(http);
+	if ((http->sock != NULL) && (http->fini != NULL)) {
+		http->fini(http->sock);
+		http->sock = NULL;
+	}
 	nni_mtx_unlock(&http->mtx);
 	nni_aio_stop(http->wr_aio);
 	nni_aio_stop(http->rd_aio);
@@ -585,6 +592,7 @@ nni_http_init(nni_http **httpp, nni_http_tran *tran)
 	http->rd       = tran->h_read;
 	http->wr       = tran->h_write;
 	http->close    = tran->h_close;
+	http->fini     = tran->h_fini;
 	http->sock     = tran->h_data;
 
 	*httpp = http;
