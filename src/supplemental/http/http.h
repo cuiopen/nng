@@ -225,10 +225,16 @@ typedef struct {
 	void (*h_cb)(nni_aio *);
 } nni_http_handler;
 
-extern int nni_http_server_init(nni_http_server **);
+// nni_http_server will look for an existing server with the same
+// socket address, or create one if one does not exist.  The servers
+// are reference counted to permit sharing the server object across
+// multiple subsystems.  The sockaddr matching is very limited though,
+// and the addresses must match *exactly*.
+extern int nni_http_server_init(nni_http_server **, nng_sockaddr *);
 
-// nni_http_server_fini closes down the server, and frees all resources
-// associated with it.  It does not affect any upgraded connections.
+// nni_http_server_fini drops the reference count on the server, and
+// if this was the last reference, closes down the server and frees
+// all related resources.  It will not affect hijacked connections.
 extern void nni_http_server_fini(nni_http_server *);
 
 // nni_http_server_add_handler registers a new handler on the server.
@@ -242,7 +248,7 @@ extern int nni_http_server_add_handler(
 extern void nni_http_server_del_handler(nni_http_server *, void *);
 
 // nni_http_server_start starts listening on the supplied port.
-extern int nni_http_server_start(nni_http_server *, nng_sockaddr *);
+extern int nni_http_server_start(nni_http_server *);
 
 // nni_http_server_stop stops the server, closing the listening socket.
 // Connections that have been "upgraded" are unaffected.  Connections

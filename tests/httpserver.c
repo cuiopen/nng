@@ -51,7 +51,7 @@ TestMain("HTTP Client", {
 		nni_aio_wait(aio);
 		So(nni_aio_result(aio) == 0);
 
-		So(nni_http_server_init(&s) == 0);
+		So(nni_http_server_init(&s, &sa) == 0);
 
 		Reset({
 			nni_aio_fini(aio);
@@ -60,7 +60,7 @@ TestMain("HTTP Client", {
 
 		So(nni_http_server_add_static(s, NULL, "text/html",
 		       "/home.html", doc, strlen(doc)) == 0);
-		So(nni_http_server_start(s, &sa) == 0);
+		So(nni_http_server_start(s) == 0);
 
 		Convey("We can connect a client to it", {
 			nni_http_client *cli;
@@ -133,7 +133,7 @@ TestMain("HTTP Client", {
 
 				aio->a_niov           = 1;
 				aio->a_iov[0].iov_len = strlen(doc);
-				aio->a_iov[0].iov_buf = chunk;
+				aio->a_iov[0].iov_buf = (void *) chunk;
 				nni_http_read_full(h, aio);
 				nni_aio_wait(aio);
 				So(nni_aio_result(aio) == 0);

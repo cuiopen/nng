@@ -13,10 +13,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static nni_mtx  nni_init_mtx;
+static nni_list nni_init_list;
+
 static int
 nni_init_helper(void)
 {
 	int rv;
+
+	nni_mtx_init(&nni_init_mtx);
+	NNI_LIST_INIT(&nni_init_list, nni_initializer, i_node);
 
 	if (((rv = nni_taskq_sys_init()) != 0) ||
 	    ((rv = nni_timer_sys_init()) != 0) ||
@@ -29,6 +35,7 @@ nni_init_helper(void)
 	    ((rv = nni_tran_sys_init()) != 0)) {
 		nni_fini();
 	}
+
 	return (rv);
 }
 
@@ -41,6 +48,19 @@ nni_init(void)
 void
 nni_fini(void)
 {
+	nni_initializer *init;
+
+	if (!nni_list_empty(&nni_init_list)) {
+		nni_mtx_lock(&nni_init_mtx);
+		while ((init = nni_list_first(&nni_init_list)) != NULL) {
+			if (init->i_fini != NULL) {
+				init->i_fini();
+			}
+			init->i_once = 0;
+			nni_list_remove(&nni_init_list, init);
+		}
+		nni_mtx_unlock(&nni_init_mtx);
+	}
 	nni_tran_sys_fini();
 	nni_proto_sys_fini();
 	nni_pipe_sys_fini();
@@ -50,5 +70,27 @@ nni_fini(void)
 	nni_aio_sys_fini();
 	nni_timer_sys_fini();
 	nni_taskq_sys_fini();
+
+	nni_mtx_fini(&nni_init_mtx);
 	nni_plat_fini();
+}
+
+int
+nni_initialize(nni_initializer *init)
+{
+	int rv;
+	if (init->i_once) {
+		return (0);
+	}
+	nni_mtx_lock(&nni_init_mtx);
+	if (init->i_once) {
+		nni_mtx_unlock(&nni_init_mtx);
+		return (0);
+	}
+	if ((rv = init->i_init()) == 0) {
+		init->i_once = 1;
+		nni_list_append(&nni_init_list, init);
+	}
+	nni_mtx_unlock(&nni_init_mtx);
+	return (rv);
 }

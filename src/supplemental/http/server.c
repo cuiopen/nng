@@ -16,6 +16,15 @@
 #include "core/nng_impl.h"
 #include "http.h"
 
+static int  http_server_sys_init(void);
+static void http_server_sys_fini(void);
+
+static nni_initializer http_server_initializer = {
+	.i_init = http_server_sys_init,
+	.i_fini = http_server_sys_fini,
+	.i_once = 0,
+};
+
 typedef struct http_handler {
 	nni_list_node node;
 	void *        h_arg;
@@ -46,6 +55,9 @@ typedef struct http_sconn {
 
 struct nni_http_server {
 	nng_sockaddr     addr;
+	nni_list_node    node;
+	int              refcnt;
+	int              starts;
 	nni_list         handlers;
 	nni_list         conns;
 	nni_list         reaps;
@@ -57,6 +69,9 @@ struct nni_http_server {
 	nni_aio *        accaio;
 	nni_plat_tcp_ep *tep;
 };
+
+static nni_list http_servers;
+static nni_mtx  http_servers_lk;
 
 static void
 http_sconn_fini(void *arg)
@@ -618,12 +633,11 @@ http_handler_fini(http_handler *h)
 	NNI_FREE_STRUCT(h);
 }
 
-void
-nni_http_server_fini(nni_http_server *s)
+static void
+http_server_fini(nni_http_server *s)
 {
 	http_handler *h;
 
-	nni_http_server_stop(s);
 	nni_mtx_lock(&s->mtx);
 	while ((!nni_list_empty(&s->conns)) || (!nni_list_empty(&s->reaps))) {
 		nni_cv_wait(&s->cv);
@@ -643,8 +657,20 @@ nni_http_server_fini(nni_http_server *s)
 	NNI_FREE_STRUCT(s);
 }
 
-int
-nni_http_server_init(nni_http_server **serverp)
+void
+nni_http_server_fini(nni_http_server *s)
+{
+	nni_mtx_lock(&http_servers_lk);
+	s->refcnt--;
+	if (s->refcnt == 0) {
+		nni_list_remove(&http_servers, s);
+		http_server_fini(s);
+	}
+	nni_mtx_unlock(&http_servers_lk);
+}
+
+static int
+http_server_init(nni_http_server **serverp, nng_sockaddr *sa)
 {
 	nni_http_server *s;
 	int              rv;
@@ -659,22 +685,63 @@ nni_http_server_init(nni_http_server **serverp)
 	NNI_LIST_INIT(&s->conns, http_sconn, node);
 	NNI_LIST_INIT(&s->reaps, http_sconn, node);
 	if ((rv = nni_aio_init(&s->accaio, http_server_acccb, s)) != 0) {
-		nni_http_server_fini(s);
+		http_server_fini(s);
 		return (rv);
 	}
+	s->addr  = *sa;
 	*serverp = s;
 	return (0);
 }
 
 int
-nni_http_server_start(nni_http_server *s, nng_sockaddr *addr)
+nni_http_server_init(nni_http_server **serverp, nng_sockaddr *sa)
 {
-	int          rv;
-	nng_sockaddr unspec;
+	int              rv;
+	nni_http_server *s;
 
-	unspec.s_un.s_family = NNG_AF_UNSPEC;
+	nni_initialize(&http_server_initializer);
 
-	s->addr = *addr;
+	nni_mtx_lock(&http_servers_lk);
+	NNI_LIST_FOREACH (&http_servers, s) {
+		switch (sa->s_un.s_family) {
+		case NNG_AF_INET:
+			if (memcmp(&s->addr.s_un.s_in, &sa->s_un.s_in,
+			        sizeof(sa->s_un.s_in)) == 0) {
+				*serverp = s;
+				s->refcnt++;
+				nni_mtx_unlock(&http_servers_lk);
+				return (0);
+			}
+			break;
+		case NNG_AF_INET6:
+			if (memcmp(&s->addr.s_un.s_in6, &sa->s_un.s_in6,
+			        sizeof(sa->s_un.s_in6)) == 0) {
+				*serverp = s;
+				s->refcnt++;
+				nni_mtx_unlock(&http_servers_lk);
+				return (0);
+			}
+			break;
+		}
+	}
+
+	// We didn't find a server, try to make a new one.
+	if ((rv = http_server_init(&s, sa)) == 0) {
+		s->addr   = *sa;
+		s->refcnt = 1;
+		nni_list_append(&http_servers, s);
+		*serverp = s;
+	}
+
+	nni_mtx_unlock(&http_servers_lk);
+	return (rv);
+}
+
+static int
+http_server_start(nni_http_server *s)
+{
+	int rv;
+
 	rv = nni_plat_tcp_ep_init(&s->tep, &s->addr, NULL, NNI_EP_MODE_LISTEN);
 	if (rv != 0) {
 		return (rv);
@@ -688,14 +755,28 @@ nni_http_server_start(nni_http_server *s, nng_sockaddr *addr)
 	return (0);
 }
 
-void
-nni_http_server_stop(nni_http_server *s)
+int
+nni_http_server_start(nni_http_server *s)
+{
+	int rv = 0;
+
+	nni_mtx_lock(&s->mtx);
+	if (s->starts == 0) {
+		rv = http_server_start(s);
+	}
+	if (rv == 0) {
+		s->starts++;
+	}
+	nni_mtx_unlock(&s->mtx);
+	return (rv);
+}
+
+static void
+http_server_stop(nni_http_server *s)
 {
 	http_sconn *sc;
 
-	nni_mtx_lock(&s->mtx);
 	if (s->closed) {
-		nni_mtx_unlock(&s->mtx);
 		return;
 	}
 
@@ -713,6 +794,16 @@ nni_http_server_stop(nni_http_server *s)
 	// upgraded connections...
 	NNI_LIST_FOREACH (&s->conns, sc) {
 		sc->close = true;
+	}
+}
+
+void
+nni_http_server_stop(nni_http_server *s)
+{
+	nni_mtx_lock(&s->mtx);
+	s->starts--;
+	if (s->starts == 0) {
+		http_server_stop(s);
 	}
 	nni_mtx_unlock(&s->mtx);
 }
@@ -814,8 +905,8 @@ nni_http_del_handler(nni_http_server *s, void *harg)
 	http_handler_fini(h);
 }
 
-// Very limited MIME type map.  Used only if the handler does not supply
-// it's own.
+// Very limited MIME type map.  Used only if the handler does not
+// supply it's own.
 static struct content_map {
 	const char *ext;
 	const char *typ;
@@ -1038,4 +1129,18 @@ nni_http_server_add_static(nni_http_server *s, const char *host,
 		return (rv);
 	}
 	return (0);
+}
+
+static int
+http_server_sys_init(void)
+{
+	NNI_LIST_INIT(&http_servers, nni_http_server, node);
+	nni_mtx_init(&http_servers_lk);
+	return (0);
+}
+
+static void
+http_server_sys_fini(void)
+{
+	nni_mtx_fini(&http_servers_lk);
 }
