@@ -69,8 +69,8 @@ TestMain("Platform Operations", {
 			usdelta = (int) (usend - usnow);
 			msdelta = (int) (msend - now);
 			So(usdelta >= 200);
-			So(usdelta < 220);
-			So(abs(msdelta - usdelta) < 20);
+			So(usdelta < 250); // increased tolerance for CIs
+			So(abs(msdelta - usdelta) < 50);
 		});
 	});
 	Convey("Mutexes work", {
