@@ -643,9 +643,9 @@ nni_tls_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 		aio->a_addr = &rsa;
 		nni_plat_tcp_resolv(rhost, rserv, NNG_AF_UNSPEC, passive, aio);
 		nni_aio_wait(aio);
-		nni_strfree(rhost);
 		nni_strfree(rserv);
 		if ((rv = nni_aio_result(aio)) != 0) {
+			nni_strfree(rhost);
 			nni_strfree(lhost);
 			nni_strfree(lserv);
 			nni_aio_fini(aio);
@@ -662,6 +662,7 @@ nni_tls_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 		nni_strfree(lhost);
 		nni_strfree(lserv);
 		if ((rv = nni_aio_result(aio)) != 0) {
+			nni_strfree(rhost);
 			nni_aio_fini(aio);
 			return (rv);
 		}
@@ -671,12 +672,14 @@ nni_tls_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 	nni_aio_fini(aio);
 
 	if ((ep = NNI_ALLOC_STRUCT(ep)) == NULL) {
+		nni_strfree(rhost);
 		return (NNG_ENOMEM);
 	}
 	nni_mtx_init(&ep->mtx);
 
 	if (nni_strlcpy(ep->addr, url, sizeof(ep->addr)) >= sizeof(ep->addr)) {
 		NNI_FREE_STRUCT(ep);
+		nni_strfree(rhost);
 		return (NNG_EADDRINVAL);
 	}
 
@@ -684,15 +687,18 @@ nni_tls_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 	    ((rv = nni_tls_config_init(&ep->cfg, tlsmode)) != 0) ||
 	    ((rv = nni_tls_config_auth_mode(ep->cfg, authmode)) != 0) ||
 	    ((rv = nni_aio_init(&ep->aio, nni_tls_ep_cb, ep)) != 0)) {
+		nni_strfree(rhost);
 		nni_tls_ep_fini(ep);
 		return (rv);
 	}
 	if ((tlsmode == NNI_TLS_CONFIG_CLIENT) && (rhost != NULL)) {
 		if ((rv = nni_tls_config_server_name(ep->cfg, rhost)) != 0) {
+			nni_strfree(rhost);
 			nni_tls_ep_fini(ep);
 			return (rv);
 		}
 	}
+	nni_strfree(rhost);
 	ep->proto    = nni_sock_proto(sock);
 	ep->authmode = authmode;
 

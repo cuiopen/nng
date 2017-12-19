@@ -120,7 +120,6 @@ nni_tran_parse_host_port(const char *pair, char **hostp, char **portp)
 	char *      port;
 	size_t      hlen, plen;
 
-	printf("QUERY %s\n", pair);
 	if (pair[0] == '[') {
 		hstart = pair + 1;
 		hlen   = 0;
@@ -163,14 +162,11 @@ nni_tran_parse_host_port(const char *pair, char **hostp, char **portp)
 			return (NNG_ENOMEM);
 		}
 	}
-	printf("ASKING %s\n", pair);
 	if (hostp) {
 		*hostp = host;
-		printf("HOST %s\n", host);
 	}
 	if (portp) {
 		*portp = port;
-		printf("PORT %s\n", port);
 	}
 	return (0);
 }
