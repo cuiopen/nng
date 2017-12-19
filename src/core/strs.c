@@ -18,35 +18,28 @@
 // part of standard C99.  (C11 has added some things here, but we cannot
 // count on them.)
 
+// Note that we supply our own version of strdup and strfree unconditionally,
+// so that these can be freed with nni_free(strlen(s)+1) if desired.  (Likewise
+// a string buffer allocated with nni_alloc can be freed with nni_strfree
+// provided the length is correct.)
+
 char *
 nni_strdup(const char *src)
 {
-#ifdef NNG_HAVE_STRDUP
-#ifdef _WIN32
-	return (_strdup(src));
-#else
-	return (strdup(src));
-#endif
-#else
 	char * dst;
-	size_t len = strlen(src);
+	size_t len = strlen(src) + 1;
 
 	if ((dst = nni_alloc(len)) != NULL) {
 		memcpy(dst, src, len);
 	}
 	return (dst);
-#endif
 }
 
 void
 nni_strfree(char *s)
 {
 	if (s != NULL) {
-#ifdef NNG_HAVE_STRDUP
-		free(s);
-#else
 		nni_free(s, strlen(s) + 1);
-#endif
 	}
 }
 

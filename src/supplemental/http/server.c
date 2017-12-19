@@ -831,10 +831,14 @@ http_server_add_handler(void **hp, nni_http_server *s, nni_http_handler *hh,
 	h->h_is_upgrader = hh->h_is_upgrader;
 	h->h_free        = freeit;
 
-	if ((hh->h_host != NULL) &&
-	    ((h->h_host = nni_strdup(hh->h_host)) == NULL)) {
-		http_handler_fini(h);
-		return (NNG_ENOMEM);
+	// Ignore the port part of the host.
+	if (hh->h_host != NULL) {
+		int rv;
+		rv = nni_tran_parse_host_port(hh->h_host, &h->h_host, NULL);
+		if (rv != 0) {
+			http_handler_fini(h);
+			return (rv);
+		}
 	}
 
 	if (((h->h_method = nni_strdup(hh->h_method)) == NULL) ||

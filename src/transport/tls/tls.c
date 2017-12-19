@@ -497,46 +497,6 @@ nni_tls_pipe_getopt_remaddr(void *arg, void *v, size_t *szp)
 	return (rv);
 }
 
-static int
-nni_tls_parse_pair(char *pair, char **hostp, char **servp)
-{
-	char *host, *serv, *end;
-
-	if (pair[0] == '[') {
-		host = pair + 1;
-		// IP address enclosed ... for IPv6 usually.
-		if ((end = strchr(host, ']')) == NULL) {
-			return (NNG_EADDRINVAL);
-		}
-		*end = '\0';
-		serv = end + 1;
-		if (*serv == ':') {
-			serv++;
-		} else if (*serv != '\0') {
-			return (NNG_EADDRINVAL);
-		}
-	} else {
-		host = pair;
-		serv = strchr(host, ':');
-		if (serv != NULL) {
-			*serv = '\0';
-			serv++;
-		}
-	}
-	if ((strlen(host) == 0) || (strcmp(host, "*") == 0)) {
-		*hostp = NULL;
-	} else {
-		*hostp = host;
-	}
-	if ((serv == NULL) || (strlen(serv) == 0)) {
-		*servp = NULL;
-	} else {
-		*servp = serv;
-	}
-	// Stash the port in big endian (network) byte order.
-	return (0);
-}
-
 // Note that the url *must* be in a modifiable buffer.
 int
 nni_tls_parse_url(char *url, char **lhost, char **lserv, char **rhost,
@@ -554,8 +514,9 @@ nni_tls_parse_url(char *url, char **lhost, char **lserv, char **rhost,
 		// is the second part.
 		*h1 = '\0';
 		h1++;
-		if (((rv = nni_tls_parse_pair(h1, rhost, rserv)) != 0) ||
-		    ((rv = nni_tls_parse_pair(url, lhost, lserv)) != 0)) {
+		if (((rv = nni_tran_parse_host_port(h1, rhost, rserv)) != 0) ||
+		    ((rv = nni_tran_parse_host_port(url, lhost, lserv)) !=
+		        0)) {
 			return (rv);
 		}
 		if ((*rserv == NULL) || (*rhost == NULL)) {
@@ -565,7 +526,7 @@ nni_tls_parse_url(char *url, char **lhost, char **lserv, char **rhost,
 	} else if (mode == NNI_EP_MODE_DIAL) {
 		*lhost = NULL;
 		*lserv = NULL;
-		if ((rv = nni_tls_parse_pair(url, rhost, rserv)) != 0) {
+		if ((rv = nni_tran_parse_host_port(url, rhost, rserv)) != 0) {
 			return (rv);
 		}
 		if ((*rserv == NULL) || (*rhost == NULL)) {
@@ -576,7 +537,7 @@ nni_tls_parse_url(char *url, char **lhost, char **lserv, char **rhost,
 		NNI_ASSERT(mode == NNI_EP_MODE_LISTEN);
 		*rhost = NULL;
 		*rserv = NULL;
-		if ((rv = nni_tls_parse_pair(url, lhost, lserv)) != 0) {
+		if ((rv = nni_tran_parse_host_port(url, lhost, lserv)) != 0) {
 			return (rv);
 		}
 		// We have to have a port to listen on!
@@ -656,9 +617,13 @@ nni_tls_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 		return (NNG_EADDRINVAL);
 	}
 
+	if ((rv = nni_aio_init(&aio, NULL, NULL)) != 0) {
+		return (rv);
+	}
 	// Parse the URLs first.
 	rv = nni_tls_parse_url(buf, &lhost, &lserv, &rhost, &rserv, mode);
 	if (rv != 0) {
+		nni_aio_fini(aio);
 		return (rv);
 	}
 	if (mode == NNI_EP_MODE_DIAL) {
@@ -671,10 +636,6 @@ nni_tls_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 		authmode = NNI_TLS_CONFIG_AUTH_MODE_NONE;
 	}
 
-	if ((rv = nni_aio_init(&aio, NULL, NULL)) != 0) {
-		return (rv);
-	}
-
 	// XXX: arguably we could defer this part to the point we do a bind
 	// or connect!
 
@@ -682,7 +643,11 @@ nni_tls_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 		aio->a_addr = &rsa;
 		nni_plat_tcp_resolv(rhost, rserv, NNG_AF_UNSPEC, passive, aio);
 		nni_aio_wait(aio);
+		nni_strfree(rhost);
+		nni_strfree(rserv);
 		if ((rv = nni_aio_result(aio)) != 0) {
+			nni_strfree(lhost);
+			nni_strfree(lserv);
 			nni_aio_fini(aio);
 			return (rv);
 		}
@@ -694,6 +659,8 @@ nni_tls_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 		aio->a_addr = &lsa;
 		nni_plat_tcp_resolv(lhost, lserv, NNG_AF_UNSPEC, passive, aio);
 		nni_aio_wait(aio);
+		nni_strfree(lhost);
+		nni_strfree(lserv);
 		if ((rv = nni_aio_result(aio)) != 0) {
 			nni_aio_fini(aio);
 			return (rv);
