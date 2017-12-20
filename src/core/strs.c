@@ -130,3 +130,28 @@ nni_strcasestr(const char *s1, const char *s2)
 	return (NULL);
 #endif
 }
+
+int
+nni_strncasecmp(const char *s1, const char *s2, size_t n)
+{
+#ifdef NNG_HAVE_STRNCASECMP
+#ifdef _WIN32
+	return (_strnicmp(s1, s2, n));
+#else
+	return (strncasecmp(s1, s2, n));
+#endif
+#else
+	for (int i = 0; i < n; i++) {
+		uint8_t c1 = (uint8_t) tolower(*s1++);
+		uint8_t c2 = (uint8_t) tolower(*s2++);
+		if (c1 == c2) {
+			if (c1 == 0) {
+				return (0);
+			}
+			continue;
+		}
+		return (c1 < c2 ? -1 : 1);
+	}
+	return (0);
+#endif
+}

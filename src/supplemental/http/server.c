@@ -418,8 +418,29 @@ http_sconn_rxdone(void *arg)
 		size_t len;
 		if (h->h_host != NULL) {
 			val = nni_http_req_get_header(req, "Host");
-			if ((val == NULL) ||
-			    (strcasecmp(val, h->h_host) != 0)) {
+			if (val == NULL) {
+				// We insist on a matching Host: line for
+				// virtual hosting.  This leaves HTTP/1.0
+				// out in the cold basically.
+				continue;
+			}
+
+			// A few ways hosts can match.  They might have
+			// a port attached -- we ignore that.  (We don't
+			// run multiple ports, so if you got here, presumably
+			// the port at least is correct!)  It might also have
+			// a lone trailing dot, so that is ok too.
+
+			// Ignore the trailing dot if the handler supplied it.
+			if ((len > 0) && (h->h_host[len - 1] == '.')) {
+				len--;
+			}
+			len = strlen(h->h_host);
+			if ((nni_strncasecmp(val, h->h_host, len) != 0)) {
+				continue;
+			}
+			if ((val[len] != '\0') && (val[len] != ':') &&
+			    ((val[len] != '.') || (val[len + 1] != '\0'))) {
 				continue;
 			}
 		}
