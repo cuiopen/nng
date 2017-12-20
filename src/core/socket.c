@@ -807,6 +807,18 @@ nni_sock_peer(nni_sock *sock)
 	return (sock->s_peer_id.p_id);
 }
 
+const char *
+nni_sock_proto_name(nni_sock *sock)
+{
+	return (sock->s_self_id.p_name);
+}
+
+const char *
+nni_sock_peer_name(nni_sock *sock)
+{
+	return (sock->s_peer_id.p_name);
+}
+
 void
 nni_sock_reconntimes(nni_sock *sock, nni_duration *rcur, nni_duration *rmax)
 {
