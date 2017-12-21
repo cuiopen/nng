@@ -9,8 +9,14 @@
 //
 
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "core/nng_impl.h"
+#include "supplemental/base64/base64.h"
+#include "supplemental/http/http.h"
+#include "supplemental/sha1/sha1.h"
 
 // Handshakes are HTTP headers.  They consist of either
 // a request or response line, followed by key-value pairs (one per line),
@@ -44,6 +50,9 @@
 // like client identifiers, should be *small*.  Certainly under 7.5KB.
 //
 
+typedef struct ws_ep   ws_ep;
+typedef struct ws_pipe ws_pipe;
+
 struct ws_ep {
 	int              mode; // NNI_EP_MODE_DIAL or NNI_EP_MODE_LISTEN
 	char             addr[NNG_MAXADDRLEN + 1];
@@ -51,10 +60,17 @@ struct ws_ep {
 	uint16_t         rproto; // remote protocol
 	size_t           rcvmax;
 	char *           host;
+	char *           serv;
 	char *           path;
 	nni_http_client *client; // only one of client or server is valid
 	nni_http_server *server;
 	nni_http_handler handler; // server only
+	char             protoname[64];
+	nni_list         ready;
+	nni_list         active;
+	nni_list         aios;
+	nni_mtx          mtx;
+	nni_aio *        connaio;
 };
 
 // The most we will send in a single fragment.  We leave this pretty large,
@@ -74,6 +90,9 @@ struct ws_ep {
 // pretty poor performance.  This is a deficiency in the SP over websocket
 // protocol -- we really would like to have the actual message size supplied.)
 #define WS_FRAGMENT_PREALLOC (1U << 20)
+
+#define WS_KEY_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#define WS_KEY_GUIDLEN 36
 
 // A substantial drawback is that we never know the actual overall message
 // size.  We should fix this in a follow up to the RFC.
@@ -147,11 +166,14 @@ typedef enum ws_reason {
 } ws_reason;
 
 struct ws_pipe {
-	int       mode;        // NNI_EP_MODE_DIAL or NNI_EP_MODE_LISTEN
-	nni_http *http;        // http transport
-	uint8_t   mask[4];     // masking key
-	uint8_t   rxhead[14];  // header buf (rx)
-	uint8_t   rxctrl[125]; // control frame payload
+	int           mode; // NNI_EP_MODE_DIAL or NNI_EP_MODE_LISTEN
+	nni_list_node node;
+	ws_ep *       ep;
+	nni_mtx       mtx;
+	nni_http *    http;        // http transport
+	uint8_t       mask[4];     // masking key
+	uint8_t       rxhead[14];  // header buf (rx)
+	uint8_t       rxctrl[125]; // control frame payload
 
 	size_t     rxheadlen;
 	size_t     rxctrllen;
@@ -159,6 +181,7 @@ struct ws_pipe {
 	size_t     rxresid; // remaining rx payload (frame)
 	bool       rxtext;  // frame is TEXT type (must check UTF-8)
 	size_t     rcvmax;  // inherited from EP
+	nni_msg *  rxmsg;
 	ws_rxstate rxstate;
 
 	uint16_t   txclose; // if set, then we should send this close code
@@ -168,23 +191,39 @@ struct ws_pipe {
 	size_t     txctrllen;
 	size_t     txresid;
 	size_t     txpaylen;
+	nni_msg *  txmsg;
 	ws_txstate txstate;
 
-	size_t rxbuflen;
-	size_t txbuflen;
-	size_t txresid;
-	size_t maxfrag; // maximum frame size
+	bool     closed;
+	uint16_t rproto;
+	uint16_t lproto;
 
 	nni_aio *user_txaio;
 	nni_aio *user_rxaio;
 
 	nni_aio *txaio;
 	nni_aio *rxaio;
-	nni_msg *rxmsg;
-	nni_mtx  mtx;
+	nni_aio *httpaio;  // server side HTTP reply
+	nni_aio *closeaio; // transmit of close request
 
-	uint8_t ws_key[16]; // Raw key value
+	nni_http_req *req;
+	nni_http_res *res;
 };
+
+static void ws_pipe_send_start(ws_pipe *);
+
+static void
+ws_pipe_http_cb(void *arg)
+{
+	ws_pipe *p  = arg;
+	ws_ep *  ep = p->ep;
+
+	// This function is only called when completing the HTTP status
+	// transmit.  This is only done on the server side.
+
+	nni_mtx_lock(&ep->mtx);
+	nni_mtx_unlock(&ep->mtx);
+}
 
 static void
 ws_pipe_recv_cb_payload(ws_pipe *p, size_t n)
@@ -193,7 +232,7 @@ ws_pipe_recv_cb_payload(ws_pipe *p, size_t n)
 	uint8_t *end;
 	nni_aio *aio = p->rxaio;
 
-	NNI_ASSSERT(n <= p->rxresid);
+	NNI_ASSERT(n <= p->rxresid);
 	p->rxresid -= n;
 
 	end = body + nni_msg_len(p->rxmsg);
@@ -203,19 +242,21 @@ ws_pipe_recv_cb_payload(ws_pipe *p, size_t n)
 		aio->a_niov           = 1;
 		aio->a_iov[0].iov_buf = end - p->rxresid;
 		aio->a_iov[0].iov_len = p->rxresid;
-		nni_http_read_full(aio);
+		nni_http_read_full(p->http, aio);
 		return;
 	}
 
+	// Data is unmasked frame-by-frame.  (Each frame can have it's own
+	// masking key.)
 	if (p->rxhead[1] & 0x80) {
 		uint8_t *beg = end - p->rxpaylen;
 		// Unmask the data.  This is done at the frame level.
-		for (int i = 0; i < p->rxlen; i++) {
-			beg[i] = beg[i] ^ p->mask[i % 4];
+		for (int i = 0; beg < end; i++, beg++) {
+			*beg ^= p->mask[i % 4];
 		}
 	}
 
-	if (p->rxbuf[0] & 0x80) {
+	if (p->rxhead[0] & 0x80) {
 		// This was final frame.
 		// XXX: check for UTF-8 validity if p->rxtext is true.
 		aio           = p->user_rxaio;
@@ -273,6 +314,8 @@ ws_apply_mask(nni_aio *aio, uint32_t maskval)
 static void
 ws_pipe_send_cancel(nni_aio *aio, int rv)
 {
+	ws_pipe *p = aio->a_prov_data;
+
 	nni_mtx_lock(&p->mtx);
 	if (p->user_txaio == aio) {
 		if (p->txstate == WS_TX_DATA) {
@@ -308,11 +351,11 @@ ws_pipe_send_cb(void *arg)
 	}
 	if (p->txstate == WS_TX_CLOSE) {
 		// If we sent the close frame, then shut things down.
-		nni_http_close(h->http);
+		nni_http_close(p->http);
 		nni_mtx_unlock(&p->mtx);
 		return;
 	}
-	if ((p->txstate == WS_TX_DATA) && (nni_msg_len(p->txmsg) == NULL)) {
+	if ((p->txstate == WS_TX_DATA) && (nni_msg_len(p->txmsg) == 0)) {
 		nni_msg_free(p->txmsg);
 		p->txmsg   = NULL;
 		p->txstate = WS_TX_IDLE;
@@ -393,8 +436,13 @@ ws_pipe_send_start(ws_pipe *p)
 			nni_msg_trim(p->txmsg, n);
 		}
 
-		op           = p->textmode ? WS_TEXT : WS_BINARY;
-		p->txhead[0] = p->txstate == WS_TX_IDLE ? op : WS_CONT;
+		// We only ever send WS_BINARY.  No support for TEXT mode.
+		if (p->txstate != WS_TX_IDLE) {
+			p->txhead[0] = WS_CONT;
+		} else {
+			p->txhead[0] = WS_BINARY;
+		}
+
 		if (nni_msg_len(p->txmsg) == 0) {
 			p->txhead[0] |= WS_FINAL;
 		}
@@ -492,7 +540,7 @@ ws_pipe_recv_cb_control(ws_pipe *p, size_t n)
 		aio->a_niov           = 1;
 		aio->a_iov[0].iov_buf = p->rxctrl + p->rxctrllen - p->rxresid;
 		aio->a_iov[0].iov_len = p->rxresid;
-		nni_http_read_full(aio);
+		nni_http_read_full(p->http, aio);
 		return;
 	}
 
@@ -524,6 +572,8 @@ ws_pipe_recv_cb_header(ws_pipe *p, size_t n)
 {
 	nni_aio *aio = p->rxaio;
 	size_t   allocsz;
+	size_t   need;
+	int      rv;
 
 	// we are reading header data.
 	p->rxheadlen += n;
@@ -553,10 +603,10 @@ ws_pipe_recv_cb_header(ws_pipe *p, size_t n)
 
 	switch (p->rxhead[1] & 0x7f) {
 	case 127:
-		p->rxpaylen = NNI_GET64(p->rxhead + 2, paylen);
+		NNI_GET64(p->rxhead + 2, p->rxpaylen);
 		break;
 	case 126:
-		p->rxpaylen = NNI_GET16(p->rxhead + 2, paylen);
+		NNI_GET16(p->rxhead + 2, p->rxpaylen);
 		break;
 	default:
 		p->rxpaylen = p->rxhead[1] & 0x7f;
@@ -613,7 +663,7 @@ ws_pipe_recv_cb_header(ws_pipe *p, size_t n)
 			return;
 		}
 		// This cannot fail, because we allocated not less than this.
-		(void) nni_msg_realloc(msg, p->rxpaylen);
+		(void) nni_msg_realloc(p->rxmsg, p->rxpaylen);
 		p->rxresid = p->rxpaylen;
 
 		// No payload, so just do an empty data receive.
@@ -677,6 +727,7 @@ ws_pipe_recv_cb(void *arg)
 	size_t   paylen;
 	bool     masked;
 	bool     final;
+	int      rv;
 
 	nni_mtx_lock(&p->mtx);
 	if ((uaio = p->user_rxaio) == NULL) {
@@ -714,7 +765,7 @@ ws_pipe_recv_cb(void *arg)
 static void
 ws_pipe_recv_cancel(nni_aio *aio, int rv)
 {
-	ws_pipe *p = arg;
+	ws_pipe *p = aio->a_prov_data;
 	nni_mtx_lock(&p->mtx);
 	if (p->user_rxaio != aio) {
 		nni_mtx_unlock(&p->mtx);
@@ -751,12 +802,13 @@ ws_pipe_recv(void *arg, nni_aio *aio)
 	p->user_rxaio = aio;
 	NNI_ASSERT(p->rxmsg == NULL);
 
-	rxaio                   = p->rxaio;
-	rxaio->a_iov[0].iov_buf = p->rxbuf;
-	rxaio->a_iov[0].iov_len = sizeof(uint16_t);
-	p->rxnum                = 0;
+	aio                   = p->rxaio;
+	aio->a_iov[0].iov_buf = p->rxhead;
+	aio->a_iov[0].iov_len = sizeof(uint16_t);
+	p->rxheadlen          = 0;
+	p->rxstate            = WS_RX_HEADER;
 
-	nni_http_read_full(p->http, rxaio);
+	nni_http_read_full(p->http, aio);
 	nni_mtx_unlock(&p->mtx);
 }
 
@@ -771,7 +823,7 @@ ws_pipe_send(void *arg, nni_aio *aio)
 	}
 	if (p->txstate == WS_TX_CLOSE) {
 		nni_aio_finish_error(aio, NNG_ECLOSED);
-		nni_tx_unlock(p->mtx);
+		nni_mtx_unlock(&p->mtx);
 	}
 	p->user_txaio = aio;
 	p->txmsg      = nni_aio_get_msg(aio);
@@ -782,19 +834,57 @@ ws_pipe_send(void *arg, nni_aio *aio)
 	nni_mtx_unlock(&p->mtx);
 }
 
-static int
+static void
 ws_pipe_fini(void *arg)
 {
 	ws_pipe *p = arg;
 
+	// Wait slightly for timeout if we were trying to send a message.
+	if (p->httpaio != NULL) {
+		nni_aio_wait(p->httpaio);
+	}
+	if (p->closeaio != NULL) {
+		nni_aio_wait(p->closeaio);
+	}
+
 	nni_aio_stop(p->rxaio);
 	nni_aio_stop(p->txaio);
+	nni_aio_stop(p->httpaio);
+	nni_aio_stop(p->closeaio);
+
+	if (p->http) {
+		nni_http_fini(p->http);
+	}
 
 	nni_aio_fini(p->rxaio);
 	nni_aio_fini(p->txaio);
+	nni_aio_fini(p->httpaio);
+	nni_aio_fini(p->closeaio);
 
+	if (p->req) {
+		nni_http_req_fini(p->req);
+	}
+	if (p->res) {
+		nni_http_res_fini(p->res);
+	}
 	nni_mtx_fini(&p->mtx);
 	NNI_FREE_STRUCT(p);
+}
+
+static void
+ws_pipe_close(void *arg)
+{
+	ws_pipe *p = arg;
+	// XXX: We have to do stuff here.
+	// Send the close frame if not already done, for one.
+	nni_mtx_lock(&p->mtx);
+	if (p->closed) {
+		nni_mtx_unlock(&p->mtx);
+	}
+	p->closed = true;
+
+	// XXX: send a close frame.
+	nni_mtx_unlock(&p->mtx);
 }
 
 static int
@@ -802,6 +892,7 @@ ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *http)
 {
 	ws_pipe *p;
 	int      rv;
+	nni_aio *aio;
 
 	if ((p = NNI_ALLOC_STRUCT(p)) == NULL) {
 		return (NNG_ENOMEM);
@@ -809,11 +900,28 @@ ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *http)
 	nni_mtx_init(&p->mtx);
 
 	// Initialize AIOs.
+	// The closeaio has no callback, but we do "wait" for it in the
+	// finish handler -- it has a strict timeout to ensure that we
+	// get the message out if at all possible.
 	if (((rv = nni_aio_init(&p->txaio, ws_pipe_send_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->rxaio, ws_pipe_recv_cb, p)) != 0)) {
+	    ((rv = nni_aio_init(&p->rxaio, ws_pipe_recv_cb, p)) != 0) ||
+	    ((rv = nni_aio_init(&p->httpaio, ws_pipe_http_cb, p)) != 0) ||
+	    ((rv = nni_aio_init(&p->closeaio, NULL, NULL)) != 0)) {
 		ws_pipe_fini(p);
 		return (rv);
 	}
+
+	// We set a timeout on the HTTP reply, because if the other side
+	// takes too long to receive it (backpressure?  Not sure how this
+	// happens with normal TCP segment sizes) then we want to kill the
+	// connection.
+	nni_aio_set_timeout(p->httpaio, 1000);
+
+	// If we take longer than 100 milliseconds to send a close, then just
+	// kill the connection.  No point in hanging around longer than that.
+	// Note that many implementations don't even bother trying to send a
+	// close frame at all!
+	nni_aio_set_timeout(p->closeaio, 100);
 
 	p->mode   = ep->mode;
 	p->rcvmax = ep->rcvmax;
@@ -821,6 +929,38 @@ ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *http)
 	p->http    = http;
 	p->rxstate = WS_RX_HEADER;
 	p->txstate = WS_TX_IDLE;
+	p->rproto  = ep->rproto;
+	p->lproto  = ep->lproto;
+
+	if (p->mode == NNI_EP_MODE_LISTEN) {
+		if (((rv = nni_http_res_init(&p->res)) != 0) ||
+		    ((rv = nni_http_res_set_version(p->res, "HTTP/1.1")) !=
+		        0)) {
+			ws_pipe_fini(p);
+			return (rv);
+		}
+	} else {
+		if (((rv = nni_http_req_init(&p->req)) != 0) ||
+		    ((rv = nni_http_req_set_version(p->req, "HTTP/1.1")) !=
+		        0)) {
+			ws_pipe_fini(p);
+			return (rv);
+		}
+	}
+
+	nni_mtx_lock(&ep->mtx);
+	p->ep = ep;
+	if ((aio = nni_list_first(&ep->aios)) != NULL) {
+		nni_aio_list_remove(aio);
+		nni_list_append(&ep->active, p);
+		nni_aio_finish_pipe(aio, p);
+	} else {
+		// Leave this on the pending list.  Probably we should set
+		// up a read to notice if the other side goes away, but
+		// the reality is that the protocol code will do so anyway.
+		nni_list_append(&ep->ready, p);
+	}
+	nni_mtx_unlock(&ep->mtx);
 
 	*pipep = p;
 	return (0);
@@ -834,116 +974,59 @@ ws_pipe_peer(void *arg)
 	return (p->rproto);
 }
 
-#if 0
-static void
-ws_pipe_start_client(ws_pipe *p, nni_aio *aio)
-{
-	int       rv;
-	nni_list *hdrs = &p->http_req_headers;
-	char      wskey[25];
-	char *    uri;
-	char *    host;
-	char *    line;
-
-	if (nni_aio_start(aio, ws_cancel_nego, p) != 0) {
-		return;
-	}
-
-	// Set up our random key.
-	for (int i = 0; i < 4; i++) {
-		uint32_t r        = nni_random();
-		p->key[i * 4 + 0] = r & 0xff;
-		r >>= 4;
-		p->key[i * 4 + 1] = r & 0xff;
-		r >>= 4;
-		p->key[i * 4 + 2] = r & 0xff;
-		r >>= 4;
-		p->key[i * 4 + 3] = r & 0xff;
-	}
-	nni_base64_encode(p->key, 16, wskey, sizeof(wskey));
-	wskey[24] = '\0';
-
-	// Construct the request headers.
-	//	snprintf(p->txhs_buf, "GET %s HTTP/1.1\r\nHost:
-	//%s\r\n", uri,
-	// host)
-	p->user_negaio = aio;
-	NNI_ASSERT(p->nego_state == WS_NEGO_INIT);
-	if (((rv = ws_set_header(hdrs, "Host", host)) != 0) ||
-	    ((rv = ws_set_header(hdrs, "Connection", "Upgrade")) != 0) ||
-	    ((rv = ws_set_header(hdrs, "Upgrade", "websocket")) != 0) ||
-	    ((rv = ws_set_header(hdrs, "Sec-WebSocket-Key", wskey)) != 0) ||
-	    ((rv = ws_set_header(hdrs, "Sec-WebSocket-Protocol", pro)) != 0) ||
-	    ((rv = ws_set_header(hdrs, "Sec-WebSocket-Version", "13")) != 0)) {
-		    p->user_negaio = NULL);
-		    nni_aio_finish_error(aio, rv);
-		    return;
-	}
-	// XXX: Origin?
-
-	host = p->hst;
-	len  = snprintf(NULL, 0, "GET %s HTTP/1.1", p->uri);
-	if ((line = nni_alloc(len)) = NULL) {
-		nni_aio_finish_error(aio, NNG_ENOMEM);
-		return;
-	}
-	if (ws_sprintf_headers(p->txhs_buf, WS_BUFSIZE, line, hdrs) < 0) {
-		nni_free(line, len);
-		nni_aio_finish_error(aio, NNG_EINVAL);
-		return;
-	}
-
-	nni_free(line, len);
-	p->txhs_get   = 0;
-	p->txhs_put   = strlen(p->txhs_buf);
-	p->nego_state = WS_NEGO_SEND_REQUEST;
-
-	ws_pipe_nego(p);
-}
-#endif
-
 static void
 ws_pipe_start(void *arg, nni_aio *aio)
 {
-	// We don't really have to do anything special here, because
-	// we negotiated before pipe creation.
 	nni_aio_finish(aio, 0, 0);
 }
 
 // We have very different approaches for server and client.
 // Servers use the HTTP server framework, and a request methodology.
 
-static void
-ws_ep_cancel(nni_aio *aio, int rv)
-{
-	// If this is a client, we just cancel the outgoing connect
-	// request.  If its an accept operation then we can simply
-	// unregister from the listener.  As another issue, we may
-	// have to free / close the listener if we were the final
-	// endpoint there.
-}
-
 static int
 ws_ep_bind(void *arg)
 {
-	// This will look for a listener, and start it if not already
-	// started. It adds the listener to it.
+	// Register with a server, and start the server running.
+	// nni_http_server_add_handler(s, &ep->handler, ep);
+	//	nni_http_server_start(s);
+	return (0);
+}
+
+static void
+ws_ep_cancel(nni_aio *aio, int rv)
+{
+	ws_ep *ep = aio->a_prov_data;
+
+	nni_mtx_lock(&ep->mtx);
+	if (nni_aio_list_active(aio)) {
+		nni_aio_list_remove(aio);
+		nni_aio_finish_error(aio, rv);
+	}
+	nni_mtx_unlock(&ep->mtx);
 }
 
 static void
 ws_ep_accept(void *arg, nni_aio *aio)
 {
-	// XXX: endpoint accept.  For this we need to start a listener
-	// if one isn't already running.  The listener needs to handle
-	// TCP completions by starting up the header negotiation, to
-	// determine the actual endpoint.
-	// This implies we need a list of endpoint listeners.
-	// I'm not sure what to do about, or whether to support at all,
-	// the notion of endpoint listeners that only listen on a
-	// specific IP address instead of INADDR_ANY.  Probably we want
-	// to have the bind address as the lookup key, and to treat
-	// INADDR_ANY separately.  Presumably we wil fail to bind() if
-	// a conflicting port reservation exists?
+	ws_ep *  ep = arg;
+	ws_pipe *p;
+
+	// We already bound, so we just need to look for an available
+	// pipe (created by the handler), and match it.
+	// Otherwise we stick the AIO in the accept list.
+	nni_mtx_lock(&ep->mtx);
+	if (!nni_aio_start(aio, ws_ep_cancel, ep)) {
+		nni_mtx_unlock(&ep->mtx);
+		return;
+	}
+	if ((p = nni_list_first(&ep->ready)) != NULL) {
+		nni_list_remove(&ep->ready, p);
+		nni_list_append(&ep->active, p);
+		nni_aio_finish_pipe(aio, p);
+	} else {
+		nni_list_append(&ep->aios, aio);
+	}
+	nni_mtx_unlock(&ep->mtx);
 }
 
 static void
@@ -953,7 +1036,7 @@ ws_ep_connect(void *arg, nni_aio *aio)
 	int    rv;
 
 	nni_mtx_lock(&ep->mtx);
-	NNI_ASSERT(ep->user_aio == NULL);
+	NNI_ASSERT(nni_list_empty(&ep->aios));
 
 	// If we can't start, then its dying and we can't report
 	// either.
@@ -962,12 +1045,8 @@ ws_ep_connect(void *arg, nni_aio *aio)
 		return;
 	}
 
-	ep->user_aio = aio;
-
-	// Start the connection process...
-	// XXX: probably we should have the callback for this start the
-	// endpoint negotiation.  Endpoint negotiation is a PITA.
-	nni_plat_tcp_ep_connect(ep->tep, ep->aio);
+	nni_list_append(&ep->aios, aio);
+	nni_http_client_connect(ep->client, ep->connaio);
 	nni_mtx_unlock(&ep->mtx);
 }
 
@@ -986,19 +1065,6 @@ ws_ep_getopt_recvmaxsz(void *arg, void *v, size_t *szp)
 {
 	ws_ep *ep = arg;
 	return (nni_getopt_size(ep->rcvmax, v, szp));
-}
-
-static int
-ws_tran_init(void)
-{
-	nni_mtx_init(&ws_lock);
-	NNI_LIST_INIT(&ws_listeners, ws_listener, node);
-}
-
-static void
-ws_tran_fini(void)
-{
-	nni_mtx_fini(&ws_lock);
 }
 
 static nni_tran_pipe_option ws_pipe_options[] = {
@@ -1044,62 +1110,191 @@ ws_ep_fini(void *arg)
 {
 	ws_ep *ep = arg;
 
+	if (ep->connaio) {
+		nni_aio_stop(ep->connaio);
+		nni_aio_fini(ep->connaio);
+	}
 	nni_strfree(ep->path);
 	nni_strfree(ep->host);
+	nni_strfree(ep->serv);
+	nni_mtx_fini(&ep->mtx);
 	NNI_FREE_STRUCT(ep);
 }
 
+// input is base64 challenge, output is the accepted.  input should be
+// 23 character base 64, output is 28 character base64 reply.  (output
+// must be large enough to hold 29 bytes to allow for termination.)
+// Returns 0 on success, NNG_EINVAL if the input is malformed somehow.
 static int
-ws_parse_pair(char *pair, char **hostp, char **servp)
+ws_make_accept(const char *key, char *accept)
 {
-	char *host, *serv, *end;
+	uint8_t      rawkey[16];
+	uint8_t      digest[20];
+	char         resp[29];
+	nni_sha1_ctx ctx;
 
-	if (pair[0] == '[') {
-		host = pair + 1;
-		// IP address enclosed ... for IPv6 usually.
-		if ((end = strchr(host, ']')) == NULL) {
-			return (NNG_EADDRINVAL);
-		}
-		*end = '\0';
-		serv = end + 1;
-		if (*serv == ':') {
-			serv++;
-		} else if (*serv != '\0') {
-			return (NNG_EADDRINVAL);
-		}
-	} else {
-		host = pair;
-		serv = strchr(host, ':');
-		if (serv != NULL) {
-			*serv = '\0';
-			serv++;
-		}
+	if ((strlen(key) != 23) ||
+	    (nni_base64_decode(key, 23, rawkey, 16) != 16)) {
+		return (NNG_EINVAL);
 	}
-	if ((strlen(host) == 0) || (strcmp(host, "*") == 0)) {
-		*hostp = NULL;
-	} else {
-		*hostp = host;
-	}
-	if ((serv == NULL) || (strlen(serv) == 0)) {
-		*servp = NULL;
-	} else {
-		*servp = serv;
-	}
+
+	nni_sha1_init(&ctx);
+	nni_sha1_update(&ctx, rawkey, 16);
+	nni_sha1_update(&ctx, (uint8_t *) WS_KEY_GUID, WS_KEY_GUIDLEN);
+	nni_sha1_final(&ctx, digest);
+
+	nni_base64_encode(digest, 20, accept, 28);
+	accept[28] = '\0';
 	return (0);
 }
 
+// ws_ep_handle handles requests coming from the server.
+static void
+ws_ep_handle(nni_aio *aio)
+{
+	nni_http *    http = nni_aio_get_input(aio, 0);
+	nni_http_req *req  = nni_aio_get_input(aio, 1);
+	nni_http_res *res;
+	ws_ep *       ep = nni_aio_get_input(aio, 2);
+	ws_pipe *     p;
+	int           rv;
+	char          keyaccept[29];
+	const char *  ptr;
+
+	nni_aio_set_input(aio, 0, NULL);
+	nni_aio_set_input(aio, 1, NULL);
+	nni_aio_set_input(aio, 2, NULL);
+	nni_aio_set_output(aio, 0, NULL);
+	nni_aio_finish(aio, 0, 0);
+
+	if ((rv = ws_pipe_init(&p, ep, http)) != 0) {
+		nni_http_req_fini(req);
+		nni_http_fini(http);
+		return;
+	}
+	p->req = req;
+
+	if ((rv = nni_http_res_init(&p->res)) != 0) {
+		ws_pipe_fini(p);
+		return;
+	}
+
+// Upgrade: websocket
+// Connection: Upgrade
+// Origin: <somewhere> (not actually used?)
+// Sec-WebSocket-Key: <xxxxx>
+// Sec-WebSocket-Protocol: <x>
+// Sec-WebSocket-Version: 13
+#define GETH(h) nni_http_req_get_header(p->req, h)
+#define SETH(h, v) nni_http_res_set_header(p->res, h, v)
+
+	// We require HTTP/1.1, valid websocket headers, and an empty
+	// GET body. We also require the WebSocket-Protocol to be
+	// present (and one we recognize).  (In theory we should *IGNORE*
+	// the GET body, but this is easier.)
+	if ((strcmp(nni_http_req_get_version(p->req), "HTTP/1.1") != 0) ||
+	    (((ptr = GETH("Content-Length")) != NULL) && (atoi(ptr) > 0)) ||
+	    (((ptr = GETH("Transfer-Encoding")) != NULL) &&
+	        (nni_strcasestr(ptr, "chunked") != NULL)) ||
+	    ((ptr = GETH("Upgrade")) == NULL) ||
+	    (strcasecmp(ptr, "websocket") != 0) ||
+	    ((ptr = GETH("Connection")) == NULL) ||
+	    (nni_strcasestr(ptr, "upgrade") == NULL) ||
+	    ((ptr = GETH("Sec-WebSocket-Version")) == NULL) ||
+	    (strcmp(ptr, "13") != 0) ||
+	    ((ptr = GETH("Sec-WebSocket-Key")) == NULL) ||
+	    (ws_make_accept(ptr, keyaccept) != 0) ||
+	    ((ptr = GETH("Sec-WebSocket-Protocol")) == NULL) ||
+	    (strcmp(ptr, ep->protoname) != 0)) {
+
+		if (((rv = SETH("Connection", "close")) != 0) ||
+		    ((rv = nni_http_res_set_status(p->res,
+		          NNI_HTTP_STATUS_BAD_REQUEST, "Bad request")) != 0)) {
+			ws_pipe_fini(p);
+			return;
+		}
+		nni_http_write_res(p->http, p->res, p->httpaio);
+		ws_pipe_fini(p);
+		return;
+	}
+
+	// HTTP/1.1 101 Switching Protocols
+	// Upgrade: websocket
+	// Connection: Upgrade
+	// Sec-WebSocket-Accept: <xxxx>
+	// Sec-WebSocket-Protocol: <x>
+
+	if (((rv = SETH("Sec-WebSocket-Accept", keyaccept)) != 0) ||
+	    ((rv = SETH("Sec-WebSocket-Protocol", ep->protoname)) != 0) ||
+	    ((rv = SETH("Connection", "upgrade")) != 0) ||
+	    ((rv = SETH("Upgrade", "websocket")) != 0) ||
+	    ((rv = nni_http_res_set_status(
+	          p->res, 101, "Switching protocols")) != 0)) {
+		ws_pipe_fini(p);
+		return;
+	}
+	nni_http_write_res(p->http, p->res, p->httpaio);
+}
+
+static void
+ws_ep_conn_cb(void *arg)
+{
+	ws_ep *   ep = arg;
+	ws_pipe * p;
+	nni_aio * aio = ep->connaio;
+	nni_aio * uaio;
+	nni_http *http = NULL;
+	int       rv;
+
+	nni_mtx_lock(&ep->mtx);
+	if (nni_aio_result(aio) == 0) {
+		http = nni_aio_get_output(aio, 0);
+	}
+	if ((uaio = nni_list_first(&ep->aios)) == NULL) {
+		// The client stopped caring about this!
+		if (http != NULL) {
+			nni_http_fini(http);
+		}
+		return;
+	}
+	nni_aio_list_remove(uaio);
+	if ((rv = nni_aio_result(aio)) != 0) {
+		nni_aio_finish_error(uaio, rv);
+	} else if ((rv = ws_pipe_init(&p, ep, http)) != 0) {
+		nni_http_fini(http);
+		nni_aio_finish_error(uaio, rv);
+	} else {
+		nni_aio_finish_pipe(uaio, p);
+	}
+	nni_mtx_unlock(&ep->mtx);
+}
+
+static void
+ws_ep_close(void *arg)
+{
+	ws_ep *ep;
+
+	// We need to remove ourself from the http servers list.
+	if (ep->mode == NNI_EP_MODE_LISTEN) {
+		// XXX: delete handler
+	} else {
+		nni_aio_cancel(ep->connaio, NNG_ECLOSED);
+		// XXX: Close the client?
+	}
+}
+
 static int
-ws_ep_init(void *epp, const char *url, nni_sock *sock, int mode)
+ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 {
 	ws_ep *      ep;
 	char         buf[NNG_MAXADDRLEN + 1];
-	char *       host;
 	char *       path;
-	char *       serv;
+	char *       pair;
 	char *       qparams;
 	bool         https = false;
 	nni_aio *    aio;
 	nng_sockaddr sa;
+	int          rv;
 
 	if (nni_strlcpy(buf, url, sizeof(buf)) >= sizeof(buf)) {
 		return (NNG_EADDRINVAL);
@@ -1107,24 +1302,24 @@ ws_ep_init(void *epp, const char *url, nni_sock *sock, int mode)
 
 	if (strncmp(buf, "ws://", strlen("ws://"))) {
 		https = false;
-		host  = buf + strlen("ws://");
+		pair  = buf + strlen("ws://");
 	} else if (strncmp(buf, "wss://", strlen("wss://"))) {
 		https = true;
-		host  = buf + strlen("wss://");
+		pair  = buf + strlen("wss://");
 		return (NNG_ENOTSUP); // NO TLS support yet.
 	} else {
 		return (NNG_EADDRINVAL);
 	}
 
-	if ((path = strchr(host, '/')) != NULL) {
+	if ((path = strchr(pair, '/')) != NULL) {
 		*path = '\0';
 		path++;
 	} else {
 		path = "/";
 	}
 	if ((qparams = strchr(path, '?')) != NULL) {
-		// We do not support query parameters.  (A peer client can
-		// still send them, we just will ignore them.)
+		// We do not support query parameters.  (A peer client
+		// can still send them, we just will ignore them.)
 		*qparams = '\0';
 	}
 
@@ -1133,18 +1328,45 @@ ws_ep_init(void *epp, const char *url, nni_sock *sock, int mode)
 		path = "/";
 	}
 
-	if ((rv = ws_parse_pair(host, &host, &serv)) != 0) {
-		return (rv);
-	}
-	if (serv == NULL) {
-		serv = https ? "443" : "80";
+	if ((ep = NNI_ALLOC_STRUCT(ep)) == NULL) {
+		return (NNG_ENOMEM);
 	}
 
-	if ((rv = nni_aio_init(aio, NULL, NULL)) != 0) {
+	nni_mtx_init(&ep->mtx);
+
+	// List of pipes (server only).
+	NNI_LIST_INIT(&ep->ready, ws_pipe, node);
+	NNI_LIST_INIT(&ep->active, ws_pipe, node);
+	nni_aio_list_init(&ep->aios);
+
+	ep->mode   = mode;
+	ep->lproto = nni_sock_proto(sock);
+	ep->rproto = nni_sock_peer(sock);
+
+	nni_strlcpy(ep->addr, url, sizeof(ep->addr));
+	if ((ep->path = nni_strdup(path)) == NULL) {
+		// Full path, may include Query Parameters.
+		ws_ep_fini(ep);
+		return (NNG_ENOMEM);
+	}
+
+	if ((rv = nni_tran_parse_host_port(pair, &ep->host, &ep->serv)) != 0) {
+		ws_ep_fini(ep);
+		return (rv);
+	}
+	if (ep->serv == NULL) {
+		if ((ep->serv = nni_strdup(https ? "443" : "80")) == NULL) {
+			ws_ep_fini(ep);
+			return (NNG_ENOMEM);
+		}
+	}
+
+	if ((rv = nni_aio_init(&aio, NULL, NULL)) != 0) {
+		ws_ep_fini(ep);
 		return (rv);
 	}
 	aio->a_addr = &sa;
-	nni_plat_tcp_resolv(host, serv, NNG_AF_UNSPEC,
+	nni_plat_tcp_resolv(ep->host, ep->serv, NNG_AF_UNSPEC,
 	    mode == NNI_EP_MODE_DIAL ? false : true, aio);
 	nni_aio_wait(aio);
 	rv = nni_aio_result(aio);
@@ -1153,33 +1375,26 @@ ws_ep_init(void *epp, const char *url, nni_sock *sock, int mode)
 		return (rv);
 	}
 
-	if ((ep = NNI_ALLOC_STRUCT(ep)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	ep->mode = mode;
-	nni_strlcpy(ep->addr, url, sizeof(ep->addr));
-
-	if ((ep->path = nni_strdup(path)) == NULL) {
-		// Full path, may include Query Parameters.
-		ws_ep_fini(ep);
-		return (NNG_ENOMEM);
-	}
-	if ((ep->host = nni_strdup(host)) == NULL) {
-		ws_ep_fini(ep);
-		return (NNG_ENOMEM);
-	}
-
 	if (mode == NNI_EP_MODE_DIAL) {
+		(void) snprintf(ep->protoname, sizeof(ep->protoname),
+		    "%s.sp.nanomsg.org", nni_sock_peer_name(sock));
 		rv = nni_http_client_init(&ep->client, &sa);
+		if (rv == 0) {
+			rv = nni_aio_init(&ep->connaio, ws_ep_conn_cb, ep);
+		}
 	} else {
-		// We actually don't support query parameters, so nuke them.
-		// (This is only for registration.  The client can still
-		// supply them, and we will match and pass to the handler.)
-		ep.handler.h_path        = ep->path;
-		ep.handler.h_method      = "GET";
-		ep.handler.h_host        = ep->host;
-		ep.handler.h_is_upgrader = true;
-		ep.handler.h_cb          = ws_ep_handle;
+		(void) snprintf(ep->protoname, sizeof(ep->protoname),
+		    "%s.sp.nanomsg.org", nni_sock_proto_name(sock));
+		// We actually don't support query parameters, so nuke
+		// them. (This is only for registration.  The client
+		// can still supply them, and we will match and pass to
+		// the handler.)
+		ep->handler.h_path        = ep->path;
+		ep->handler.h_method      = "GET";
+		ep->handler.h_host        = ep->host;
+		ep->handler.h_is_upgrader = true;
+		ep->handler.h_is_dir      = false;
+		ep->handler.h_cb          = ws_ep_handle;
 		rv = nni_http_server_init(&ep->server, &sa);
 	}
 
@@ -1187,6 +1402,8 @@ ws_ep_init(void *epp, const char *url, nni_sock *sock, int mode)
 		ws_ep_fini(ep);
 		return (rv);
 	}
+	*epp = ep;
+	return (0);
 }
 
 static nni_tran_ep ws_ep_ops = {
@@ -1204,8 +1421,8 @@ static nni_tran ws_tran = {
 	.tran_scheme  = "ws",
 	.tran_ep      = &ws_ep_ops,
 	.tran_pipe    = &ws_pipe_ops,
-	.tran_init    = ws_tran_init,
-	.tran_fini    = ws_tran_fini,
+	.tran_init    = NULL,
+	.tran_fini    = NULL,
 };
 
 int

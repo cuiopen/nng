@@ -136,6 +136,7 @@ add_subdirectory(transport/inproc)
 add_subdirectory(transport/ipc)
 add_subdirectory(transport/tcp)
 add_subdirectory(transport/tls)
+add_subdirectory(transport/ws)
 add_subdirectory(transport/zerotier)
 
 include_directories(AFTER SYSTEM ${PROJECT_SOURCE_DIR}/src
