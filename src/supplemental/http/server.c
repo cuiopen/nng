@@ -266,80 +266,12 @@ http_uri_canonify(char *path)
 	return (path);
 }
 
-static int
-http_make_error(nni_http_res **resp, int err)
-{
-	// XXX: add handling for overrides.
-	char *        rsn;
-	char          rsnbuf[80];
-	char          html[1024];
-	nni_http_res *res;
-
-	if ((nni_http_res_init(&res)) != 0) {
-		return (NNG_ENOMEM);
-	}
-
-	switch (err) {
-	case NNI_HTTP_STATUS_BAD_REQUEST:
-		rsn = "Bad request";
-		break;
-	case NNI_HTTP_STATUS_UNAUTHORIZED:
-		rsn = "Unauthorized";
-		break;
-	case NNI_HTTP_STATUS_PAYMENT_REQUIRED:
-		rsn = "Payment required";
-		break;
-	case NNI_HTTP_STATUS_NOT_FOUND:
-		rsn = "Resource not found";
-		break;
-	case NNI_HTTP_STATUS_METHOD_NOT_ALLOWED:
-		rsn = "Method not allowed";
-		break;
-	case NNI_HTTP_STATUS_NOT_ACCEPTABLE:
-		rsn = "Not acceptable";
-		break;
-	case NNI_HTTP_STATUS_FORBIDDEN:
-		rsn = "Forbidden";
-		break;
-	case NNI_HTTP_STATUS_HTTP_VERSION_NOT_SUPP:
-		rsn = "HTTP version not supported";
-		break;
-	default:
-		snprintf(rsnbuf, sizeof(rsnbuf), "HTTP error code %d", err);
-		rsn = rsnbuf;
-		break;
-	}
-
-	// very simple builtin error page
-	snprintf(html, sizeof(html),
-	    "<head><title>%d %s</title></head>"
-	    "<body><p/><h1 align=\"center\">"
-	    "<span style=\"font-size: 36px; border-radius: 5px; "
-	    "background-color: black; color: white; padding: 7px; "
-	    "font-family: Arial, sans serif;\">%d</span></h1>"
-	    "<p align=\"center\">"
-	    "<span style=\"font-size: 24px; font-family: Arial, sans serif;\">"
-	    "%s</span></p></body>",
-	    err, rsn, err, rsn);
-
-	nni_http_res_set_status(res, err, rsn);
-	nni_http_res_copy_data(res, html, strlen(html));
-	nni_http_res_set_version(res, "HTTP/1.1");
-	nni_http_res_set_header(
-	    res, "Content-Type", "text/html; charset=UTF-8");
-	// We could set the date, but we don't necessarily have a portable
-	// way to get the time of day.
-
-	*resp = res;
-	return (0);
-}
-
 static void
-http_sconn_error(http_sconn *sc, int err)
+http_sconn_error(http_sconn *sc, uint16_t err)
 {
 	nni_http_res *res;
 
-	if (http_make_error(&res, err) != 0) {
+	if (nni_http_res_init_error(&res, err) != 0) {
 		http_sconn_close(sc);
 		return;
 	}
@@ -516,15 +448,17 @@ http_sconn_cbdone(void *arg)
 		return;
 	}
 
-	h = nni_aio_get_data(aio, 1);
-	if (h->h_is_upgrader) {
-		sc->http = NULL;
-		// This isn't a real close, because the HTTP channel
-		// is done.  But it does free up our resources.
-		http_sconn_close(sc);
+	h   = nni_aio_get_data(aio, 1);
+	res = nni_aio_get_output(aio, 0);
+
+	// If its an upgrader, and they didn't give us back a response, it
+	// means that they took over, and we should just discard this session,
+	// without closing the underlying channel.
+	if ((h->h_is_upgrader) && (res == NULL)) {
+		sc->http = NULL;      // the underlying HTTP is not closed
+		http_sconn_close(sc); // discard server session though
 		return;
 	}
-	res = nni_aio_get_output(aio, 0);
 	if (res != NULL) {
 
 		const char *val;
@@ -919,7 +853,7 @@ nni_http_server_add_handler(
 }
 
 void
-nni_http_del_handler(nni_http_server *s, void *harg)
+nni_http_server_del_handler(nni_http_server *s, void *harg)
 {
 	http_handler *h = harg;
 
@@ -1001,7 +935,7 @@ http_handle_file(nni_aio *aio)
 	nni_http_res *res = NULL;
 	void *        data;
 	size_t        size;
-	int           status;
+	uint16_t      status;
 	int           rv;
 
 	if ((rv = nni_plat_file_get(f->pth, &data, &size)) != 0) {
@@ -1019,7 +953,7 @@ http_handle_file(nni_aio *aio)
 			status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 			break;
 		}
-		if ((rv = http_make_error(&res, status)) != 0) {
+		if ((rv = nni_http_res_init_error(&res, status)) != 0) {
 			nni_aio_finish_error(aio, rv);
 			return;
 		}

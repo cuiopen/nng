@@ -9,6 +9,7 @@
 //
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -154,4 +155,26 @@ nni_strncasecmp(const char *s1, const char *s2, size_t n)
 	}
 	return (0);
 #endif
+}
+
+int
+nni_asprintf(char **sp, const char *fmt, ...)
+{
+	va_list ap;
+	size_t  len;
+	char *  s;
+
+	va_start(ap, fmt);
+	len = vsnprintf(NULL, 0, fmt, ap);
+	va_end(ap);
+	len++;
+
+	if ((s = nni_alloc(len)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+	va_start(ap, fmt);
+	(void) vsnprintf(s, len, fmt, ap);
+	va_end(ap);
+	*sp = s;
+	return (0);
 }

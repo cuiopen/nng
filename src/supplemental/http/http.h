@@ -63,6 +63,7 @@ extern int  nni_http_res_set_data(nni_http_res *, const void *, size_t);
 extern int  nni_http_res_copy_data(nni_http_res *, const void *, size_t);
 extern int  nni_http_res_alloc_data(nni_http_res *, size_t);
 extern void nni_http_res_get_data(nni_http_res *, void **, size_t *);
+extern int  nni_http_res_init_error(nni_http_res **, uint16_t);
 
 // HTTP status codes.  This list is not exhaustive.
 enum { NNI_HTTP_STATUS_CONTINUE                  = 100,
@@ -99,8 +100,8 @@ enum { NNI_HTTP_STATUS_CONTINUE                  = 100,
 	NNI_HTTP_STATUS_GONE                     = 410,
 	NNI_HTTP_STATUS_LENGTH_REQUIRED          = 411,
 	NNI_HTTP_STATUS_PRECONDITION_FAILED      = 412,
-	NNI_HTTP_STATUS_REQUEST_ENTITY_TOO_LARGE = 413,
-	NNI_HTTP_STATUS_REQUEST_URI_TOO_LONG     = 414,
+	NNI_HTTP_STATUS_PAYLOAD_TOO_LARGE        = 413,
+	NNI_HTTP_STATUS_URI_TOO_LONG             = 414,
 	NNI_HTTP_STATUS_UNSUPPORTED_MEDIA_TYPE   = 415,
 	NNI_HTTP_STATUS_RANGE_NOT_SATISFIABLE    = 416,
 	NNI_HTTP_STATUS_EXPECTATION_FAILED       = 417,

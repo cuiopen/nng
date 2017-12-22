@@ -835,3 +835,125 @@ nni_http_res_parse(nni_http_res *res, void *buf, size_t n, size_t *lenp)
 	*lenp = len;
 	return (rv);
 }
+
+int
+nni_http_res_init_error(nni_http_res **resp, uint16_t err)
+{
+	char *        rsn;
+	char          rsnbuf[80];
+	char          html[1024];
+	nni_http_res *res;
+
+	if ((nni_http_res_init(&res)) != 0) {
+		return (NNG_ENOMEM);
+	}
+
+	// Note that it is expected that redirect URIs will update the
+	// payload to reflect the target location.
+	switch (err) {
+	case NNI_HTTP_STATUS_STATUS_MOVED_PERMANENTLY:
+		rsn = "Moved Permanently";
+		break;
+	case NNI_HTTP_STATUS_MULTIPLE_CHOICES:
+		rsn = "Multiple Choices";
+		break;
+	case NNI_HTTP_STATUS_FOUND:
+		rsn = "Found";
+		break;
+	case NNI_HTTP_STATUS_SEE_OTHER:
+		rsn = "See Other";
+		break;
+	case NNI_HTTP_STATUS_TEMPORARY_REDIRECT:
+		rsn = "Temporary Redirect";
+		break;
+	case NNI_HTTP_STATUS_BAD_REQUEST:
+		rsn = "Bad Request";
+		break;
+	case NNI_HTTP_STATUS_UNAUTHORIZED:
+		rsn = "Unauthorized";
+		break;
+	case NNI_HTTP_STATUS_PAYMENT_REQUIRED:
+		rsn = "Payment Required";
+		break;
+	case NNI_HTTP_STATUS_NOT_FOUND:
+		rsn = "Not Found";
+		break;
+	case NNI_HTTP_STATUS_METHOD_NOT_ALLOWED:
+		// Caller must also supply an Allow: header
+		rsn = "Method Not Allowed";
+		break;
+	case NNI_HTTP_STATUS_NOT_ACCEPTABLE:
+		rsn = "Not Acceptable";
+		break;
+	case NNI_HTTP_STATUS_REQUEST_TIMEOUT:
+		rsn = "Request Timeout";
+		break;
+	case NNI_HTTP_STATUS_CONFLICT:
+		rsn = "Conflict";
+		break;
+	case NNI_HTTP_STATUS_GONE:
+		rsn = "Gone";
+		break;
+	case NNI_HTTP_STATUS_LENGTH_REQUIRED:
+		rsn = "Length Required";
+		break;
+	case NNI_HTTP_STATUS_PAYLOAD_TOO_LARGE:
+		rsn = "Payload Too Large";
+		break;
+	case NNI_HTTP_STATUS_FORBIDDEN:
+		rsn = "Forbidden";
+		break;
+	case NNI_HTTP_STATUS_URI_TOO_LONG:
+		rsn = "URI Too Long";
+		break;
+	case NNI_HTTP_STATUS_UNSUPPORTED_MEDIA_TYPE:
+		rsn = "Unsupported Media Type";
+		break;
+	case NNI_HTTP_STATUS_EXPECTATION_FAILED:
+		rsn = "Expectation Failed";
+		break;
+	case NNI_HTTP_STATUS_UPGRADE_REQUIRED:
+		// Caller must add "Upgrade:" header.
+		rsn = "Upgrade Required";
+		break;
+	case NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR:
+		rsn = "Internal Server Error";
+		break;
+	case NNI_HTTP_STATUS_HTTP_VERSION_NOT_SUPP:
+		rsn = "HTTP version not supported";
+		break;
+	case NNI_HTTP_STATUS_NOT_IMPLEMENTED:
+		rsn = "Not Implemented";
+		break;
+	case NNI_HTTP_STATUS_SERVICE_UNAVAILABLE:
+		rsn = "Service Unavailable";
+		break;
+	default:
+		snprintf(rsnbuf, sizeof(rsnbuf), "HTTP error code %d", err);
+		rsn = rsnbuf;
+		break;
+	}
+
+	// very simple builtin error page
+	snprintf(html, sizeof(html),
+	    "<head><title>%d %s</title></head>"
+	    "<body><p/><h1 align=\"center\">"
+	    "<span style=\"font-size: 36px; border-radius: 5px; "
+	    "background-color: black; color: white; padding: 7px; "
+	    "font-family: Arial, sans serif;\">%d</span></h1>"
+	    "<p align=\"center\">"
+	    "<span style=\"font-size: 24px; font-family: Arial, sans serif;\">"
+	    "%s</span></p></body>",
+	    err, rsn, err, rsn);
+
+	nni_http_res_set_status(res, err, rsn);
+	nni_http_res_copy_data(res, html, strlen(html));
+	nni_http_res_set_version(res, "HTTP/1.1");
+	nni_http_res_set_header(
+	    res, "Content-Type", "text/html; charset=UTF-8");
+	// We could set the date, but we don't necessarily have a portable
+	// way to get the time of day.
+
+	*resp = res;
+	return (0);
+}
