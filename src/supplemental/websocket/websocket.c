@@ -68,11 +68,18 @@ struct nni_ws_dialer {
 	nni_tls_config * tls;
 	nni_http_req *   req;
 	nni_http_client *client;
+	nni_mtx          mtx;
+	nni_aio *        conaio;
 	char *           proto;
+	char *           host;
+	char *           serv;
+	char *           path;
+	char *           qinfo;
 	char *           url;
 	nni_list         aios;
 	bool             started;
 	bool             closed;
+	nng_sockaddr     sa;
 };
 
 typedef enum ws_type {
@@ -1032,7 +1039,7 @@ nni_ws_listener_fini(nni_ws_listener *l)
 #define WS_KEY_GUIDLEN 36
 
 // input is base64 challenge, output is the accepted.  input should be
-// 23 character base 64, output is 28 character base64 reply.  (output
+// 24 character base 64, output is 28 character base64 reply.  (output
 // must be large enough to hold 29 bytes to allow for termination.)
 // Returns 0 on success, NNG_EINVAL if the input is malformed somehow.
 static int
@@ -1043,8 +1050,8 @@ ws_make_accept(const char *key, char *accept)
 	char         resp[29];
 	nni_sha1_ctx ctx;
 
-	if ((strlen(key) != 23) ||
-	    (nni_base64_decode(key, 23, rawkey, 16) != 16)) {
+	if ((strlen(key) != 24) ||
+	    (nni_base64_decode(key, 24, rawkey, 16) != 16)) {
 		return (NNG_EINVAL);
 	}
 
@@ -1215,6 +1222,7 @@ ws_handler(nni_aio *aio)
 	// XXX: Inherit fragmentation and message size limits!
 
 	nni_list_append(&l->reply, ws);
+	nni_aio_set_data(ws->httpaio, 0, l);
 	nni_http_write_res(http, res, ws->httpaio);
 	nni_aio_set_output(aio, 0, NULL);
 	nni_aio_set_input(aio, 1, NULL);
@@ -1229,6 +1237,89 @@ err:
 		nni_aio_set_output(aio, 0, res);
 		nni_aio_finish(aio, 0, 0);
 	}
+}
+#undef GETH
+#undef SETH
+
+static int
+ws_parse_url(const char *url, char **schemep, char **hostp, char **servp,
+    char **pathp, char **queryp)
+{
+	size_t scrlen;
+	char * scr;
+	char * pair;
+	char * scheme = NULL;
+	char * path   = NULL;
+	char * query  = NULL;
+	char * host   = NULL;
+	char * serv   = NULL;
+	int    rv;
+
+	// We need a scratch copy of the url to parse.
+	scrlen = strlen(url) + 1;
+	if ((scr = nni_alloc(scrlen)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+	scheme = scr;
+	pair   = strchr(scr, ':');
+	if ((pair == NULL) || (pair[1] != '/') || (pair[2] != '/')) {
+		nni_free(scr, scrlen);
+		return (NNG_EADDRINVAL);
+	}
+
+	*pair = '\0';
+	pair += 3;
+
+	path = strchr(pair, '/');
+	if (path != NULL) {
+		*path = '\0'; // We will restore it shortly.
+	}
+	if ((rv = nni_tran_parse_host_port(pair, hostp, servp)) != 0) {
+		nni_free(scr, scrlen);
+		return (rv);
+	}
+
+	if (path) {
+		// Restore the path, and trim off the query parameter.
+		*path = '/';
+		query = strchr(path, '?');
+	} else {
+		path  = "/";
+		query = "";
+	}
+
+	if (schemep) {
+		*schemep = nni_strdup(scheme);
+	}
+	if (pathp) {
+		*pathp = nni_strdup(path);
+	}
+	if (queryp) {
+		*queryp = nni_strdup(query);
+	}
+
+	if ((schemep && (*schemep == NULL)) || (pathp && (*pathp == NULL)) ||
+	    (queryp && (*queryp == NULL))) {
+		if (hostp) {
+			nni_strfree(*hostp);
+		}
+		if (servp) {
+			nni_strfree(*servp);
+		}
+		if (schemep) {
+			nni_strfree(*schemep);
+		}
+		if (pathp) {
+			nni_strfree(*pathp);
+		}
+		if (queryp) {
+			nni_strfree(*queryp);
+		}
+		nni_free(scr, scrlen);
+		return (NNG_ENOMEM);
+	}
+
+	return (0);
 }
 
 int
@@ -1453,12 +1544,218 @@ nni_ws_listener_tls(nni_ws_listener *l, nni_tls_config *tls)
 	// We need to add this later.
 }
 
-extern int  nni_ws_dialer_init(nni_ws_listener **, const char *);
-extern void nni_ws_dialer_fini(nni_ws_dialer *);
-extern void nni_ws_dialer_close(nni_ws_dialer *);
-extern int  nni_ws_dialer_proto(nni_ws_dialer *, const char *);
-extern void nni_ws_dialer_dial(nni_ws_dialer *, nni_aio *);
-extern int  nni_ws_dialer_header(nni_ws_dialer *, const char *, const char *);
+#define GETH(h) nni_http_res_get_header(res, h)
+#define SETH(h, v) nni_http_req_set_header(req, h, v)
+
+void
+ws_conn_cb(void *arg)
+{
+	nni_ws_dialer *d   = arg;
+	nni_aio *      aio = d->conaio;
+	nni_aio *      uaio;
+	nni_http *     http;
+	nni_http_req * req = NULL;
+	char *         uri = NULL;
+	int            rv;
+	uint8_t        raw[16];
+	char           wskey[25];
+	nni_ws *       ws;
+
+	nni_mtx_lock(&d->mtx);
+	if ((rv = nni_aio_result(aio)) != 0) {
+		// Go ahead and abort all of them.  Theoretically we could
+		// abort just one, but if one fails, all should, and the
+		// semantic is still correct.
+		while ((uaio = nni_list_first(&d->aios)) != NULL) {
+			nni_aio_list_remove(uaio);
+			nni_aio_finish_error(uaio, rv);
+		}
+		nni_mtx_unlock(&d->mtx);
+		return;
+	}
+	http = nni_aio_get_output(aio, 0);
+	if ((uaio = nni_list_first(&d->aios)) == NULL) {
+		// User connect canceled?
+		nni_http_fini(http);
+		nni_mtx_unlock(&d->mtx);
+		return;
+	}
+
+	if (d->qinfo && d->qinfo[0] != '\0') {
+		rv = nni_asprintf(&uri, "%s?%s", d->path, d->qinfo);
+		if (rv != 0) {
+			goto err;
+		}
+	} else if ((uri = nni_strdup(d->path)) == NULL) {
+		rv = NNG_ENOMEM;
+		goto err;
+	}
+
+	for (int i = 0; i < 16; i++) {
+		raw[i] = nni_random();
+	}
+	nni_base64_encode(raw, 16, wskey, 24);
+	wskey[24] = '\0';
+
+	if (((rv = nni_http_req_init(&req)) != 0) ||
+	    ((rv = nni_http_req_set_uri(req, uri)) != 0) ||
+	    ((rv = nni_http_req_set_version(req, "HTTP/1.1")) != 0) ||
+	    ((rv = nni_http_req_set_method(req, "GET")) != 0) ||
+	    ((rv = SETH("Host", d->host)) != 0) ||
+	    ((rv = SETH("Upgrade", "websocket")) != 0) ||
+	    ((rv = SETH("Connection", "Upgrade")) != 0) ||
+	    ((rv = SETH("Sec-WebSocket-Key", wskey)) != 0) ||
+	    ((rv = SETH("Sec-WebSocket-Version", "13")) != 0)) {
+		goto err;
+	}
+
+	// If consumer asked for protocol, pass it on.
+	if ((d->proto != NULL) &&
+	    ((rv = SETH("Sec-WebSocket-Protocol", d->proto)) != 0)) {
+		goto err;
+	}
+
+	if ((rv = ws_init(&ws, http, req, NULL)) != 0) {
+		goto err;
+	}
+
+	nni_aio_list_remove(uaio);
+	nni_http_write_req(http, req, ws->httpaio);
+
+err:
+	nni_aio_list_remove(uaio);
+	nni_aio_finish_error(uaio, rv);
+	nni_http_fini(http);
+	nni_mtx_unlock(&d->mtx);
+}
+
+void
+nni_ws_dialer_fini(nni_ws_dialer *d)
+{
+	nni_strfree(d->proto);
+	nni_strfree(d->url);
+	if (d->client) {
+		nni_http_client_fini(d->client);
+	}
+	nni_mtx_fini(&d->mtx);
+	NNI_FREE_STRUCT(d);
+}
+
+int
+nni_ws_dialer_init(nni_ws_dialer **dp, const char *url)
+{
+	nni_ws_dialer *d;
+	int            rv;
+	nni_aio *      aio;
+
+	if ((d = NNI_ALLOC_STRUCT(d)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+	nni_mtx_init(&d->mtx);
+	if ((d->url = nni_strdup(url)) == NULL) {
+		nni_ws_dialer_fini(d);
+		return (NNG_ENOMEM);
+	}
+	if ((rv = ws_parse_url(
+	         url, NULL, &d->host, &d->serv, &d->path, &d->qinfo)) != 0) {
+		nni_ws_dialer_fini(d);
+		return (rv);
+	}
+
+	if ((rv = nni_aio_init(&aio, NULL, NULL)) != 0) {
+		nni_ws_dialer_fini(d);
+		return (rv);
+	}
+	// XXX: this is synchronous.  We should fix this in the HTTP layer.
+	aio->a_addr = &d->sa;
+	nni_plat_tcp_resolv(d->host, d->serv, NNG_AF_UNSPEC, false, aio);
+	nni_aio_wait(aio);
+	rv = nni_aio_result(aio);
+	nni_aio_fini(aio);
+	if (rv != 0) {
+		nni_ws_dialer_fini(d);
+		return (rv);
+	}
+
+	if ((rv = nni_http_client_init(&d->client, &d->sa)) != 0) {
+		nni_ws_dialer_fini(d);
+		return (rv);
+	}
+
+	*dp = d;
+	return (0);
+}
+
+void
+nni_ws_dialer_close(nni_ws_dialer *d)
+{
+	// XXX: what to do here?
+	nni_mtx_lock(&d->mtx);
+	if (d->closed) {
+		nni_mtx_unlock(&d->mtx);
+		return;
+	}
+	d->closed = true;
+	nni_mtx_unlock(&d->mtx);
+	nni_aio_cancel(d->conaio, NNG_ECLOSED);
+}
+
+int
+nni_ws_dialer_proto(nni_ws_dialer *d, const char *proto)
+{
+	int   rv = 0;
+	char *ns;
+	nni_mtx_lock(&d->mtx);
+	if ((ns = nni_strdup(proto)) == NULL) {
+		rv = NNG_ENOMEM;
+	} else {
+		if (d->proto != NULL) {
+			nni_strfree(d->proto);
+		}
+		d->proto = ns;
+	}
+	nni_mtx_unlock(&d->mtx);
+	return (rv);
+}
+
+static void
+ws_dial_cancel(nni_aio *aio, int rv)
+{
+	nni_ws_dialer *d = aio->a_prov_data;
+	nni_mtx_lock(&d->mtx);
+	// If we are waiting, then we can cancel.  Otherwise we need
+	// to abort.
+	if (nni_aio_list_active(aio)) {
+		nni_aio_list_remove(aio);
+		nni_aio_finish_error(aio, rv);
+	}
+	// This does not cancel in-flight client negotiations with HTTP.
+	nni_mtx_unlock(&d->mtx);
+}
+
+void
+nni_ws_dialer_dial(nni_ws_dialer *d, nni_aio *aio)
+{
+	nni_mtx_lock(&d->mtx);
+	// First look up the host.
+	if (nni_aio_start(aio, ws_dial_cancel, d) != 0) {
+		nni_mtx_unlock(&d->mtx);
+		return;
+	}
+	if (d->closed) {
+		nni_aio_finish_error(aio, NNG_ECLOSED);
+		nni_mtx_unlock(&d->mtx);
+	}
+	nni_list_append(&d->aios, aio);
+
+	if (!d->started) {
+		d->started = true;
+		nni_http_client_connect(d->client, d->conaio);
+	}
+	nni_mtx_unlock(&d->mtx);
+}
+
+extern int nni_ws_dialer_header(nni_ws_dialer *, const char *, const char *);
 
 // Dialer does not get a hook chance, as it can examine the request
 // and reply after dial is done; this is not a 3-way handshake, so

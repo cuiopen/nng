@@ -38,7 +38,7 @@ extern void nni_ws_listener_hook(
     nni_ws_listener *, nni_ws_listen_hook, void *);
 extern void nni_ws_listener_tls(nni_ws_listener *, nni_tls_config *);
 
-extern int  nni_ws_dialer_init(nni_ws_listener **, const char *);
+extern int  nni_ws_dialer_init(nni_ws_dialer **, const char *);
 extern void nni_ws_dialer_fini(nni_ws_dialer *);
 extern void nni_ws_dialer_close(nni_ws_dialer *);
 extern int  nni_ws_dialer_proto(nni_ws_dialer *, const char *);
