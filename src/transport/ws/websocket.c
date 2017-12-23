@@ -40,6 +40,9 @@ struct ws_ep {
 	nni_list         aios;
 	nni_mtx          mtx;
 	nni_aio *        connaio;
+	nni_aio *        accaio;
+
+	nni_ws_listener *listener;
 };
 
 // The most we will send in a single fragment.  We leave this pretty large,
@@ -62,77 +65,6 @@ struct ws_ep {
 
 #define WS_KEY_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 #define WS_KEY_GUIDLEN 36
-
-// A substantial drawback is that we never know the actual overall message
-// size.  We should fix this in a follow up to the RFC.
-
-// Websocket binary message header structure:
-//
-// {
-//      int fin:1;
-//      int rsv:3;  -- must be zero
-//      int opcode:4;
-//      int mask:1;
-//      int payload_len:7;
-//      int extended_payload_len:16...64;
-//        ... extended is 16bits if payload_len == 126
-//        ... extended is 64bits if payload_len == 127
-//        ... extended is absent otherwise (len <= 125)
-//      int masking_key:32; (if mask == 1)
-// }
-//
-// If the variable length of that header makes you want to vomit,
-// rest assured that you are not alone.  So we will read the 16
-// bits of the mandatory header parts, then use that to decide
-// how many more bits to read -- between 0 and 96.
-//
-// client sends data with mask, server sends without
-//
-// opcodes:
-// 0x0: continuation
-// 0x1: text frame
-// 0x2: binary frame
-// 0x8: close
-// 0x9: ping
-// 0xa: pong
-
-typedef enum ws_opcode {
-	WS_CONT   = 0x00,
-	WS_TEXT   = 0x01,
-	WS_BINARY = 0x02,
-	WS_CLOSE  = 0x08,
-	WS_PING   = 0x09,
-	WS_PONG   = 0x0A,
-	WS_FINAL  = 0x80,
-} ws_opcode;
-
-typedef enum ws_rxstate {
-	WS_RX_HEADER,
-	WS_RX_CONTROL,
-	WS_RX_PAYLOAD,
-	WS_RX_CLOSE,
-} ws_rxstate;
-
-typedef enum ws_txstate {
-	WS_TX_IDLE,
-	WS_TX_DATA,
-	WS_TX_CONTROL,
-	WS_TX_CLOSE,
-} ws_txstate;
-
-// These are close reasons -- only the ones that can be sent over the
-// wire are listed here.  RFC6455 reserves 1004, 1005, 1006, and 1015.
-typedef enum ws_reason {
-	WS_CLOSE_NORMAL_CLOSE  = 1000,
-	WS_CLOSE_GOING_AWAY    = 1001,
-	WS_CLOSE_PROTOCOL_ERR  = 1002,
-	WS_CLOSE_UNSUPP_FORMAT = 1003,
-	WS_CLOSE_INVALID_DATA  = 1007,
-	WS_CLOSE_POLICY        = 1008,
-	WS_CLOSE_TOO_BIG       = 1009,
-	WS_CLOSE_NO_EXTENSION  = 1010,
-	WS_CLOSE_INTERNAL      = 1011,
-} ws_reason;
 
 struct ws_pipe {
 	int           mode; // NNI_EP_MODE_DIAL or NNI_EP_MODE_LISTEN
@@ -300,15 +232,9 @@ static void
 ws_pipe_close(void *arg)
 {
 	ws_pipe *p = arg;
-	// XXX: We have to do stuff here.
-	// Send the close frame if not already done, for one.
-	nni_mtx_lock(&p->mtx);
-	if (p->closed) {
-		nni_mtx_unlock(&p->mtx);
-	}
-	p->closed = true;
 
-	// XXX: send a close frame.
+	nni_mtx_lock(&p->mtx);
+	nni_ws_close(p->ws);
 	nni_mtx_unlock(&p->mtx);
 }
 
@@ -347,11 +273,6 @@ ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *http)
 		nni_aio_list_remove(aio);
 		nni_list_append(&ep->active, p);
 		nni_aio_finish_pipe(aio, p);
-	} else {
-		// Leave this on the pending list.  Probably we should set
-		// up a read to notice if the other side goes away, but
-		// the reality is that the protocol code will do so anyway.
-		nni_list_append(&ep->ready, p);
 	}
 	nni_mtx_unlock(&ep->mtx);
 
@@ -370,7 +291,9 @@ ws_pipe_peer(void *arg)
 static void
 ws_pipe_start(void *arg, nni_aio *aio)
 {
-	nni_aio_finish(aio, 0, 0);
+	if (nni_aio_start(aio, NULL, NULL) == 0) {
+		nni_aio_finish(aio, 0, 0);
+	}
 }
 
 // We have very different approaches for server and client.
@@ -379,10 +302,8 @@ ws_pipe_start(void *arg, nni_aio *aio)
 static int
 ws_ep_bind(void *arg)
 {
-	// Register with a server, and start the server running.
-	// nni_http_server_add_handler(s, &ep->handler, ep);
-	//	nni_http_server_start(s);
-	return (0);
+	ws_ep *ep = arg;
+	return (nni_ws_listener_listen(ep->listener));
 }
 
 static void
@@ -412,12 +333,9 @@ ws_ep_accept(void *arg, nni_aio *aio)
 		nni_mtx_unlock(&ep->mtx);
 		return;
 	}
-	if ((p = nni_list_first(&ep->ready)) != NULL) {
-		nni_list_remove(&ep->ready, p);
-		nni_list_append(&ep->active, p);
-		nni_aio_finish_pipe(aio, p);
-	} else {
-		nni_list_append(&ep->aios, aio);
+	nni_list_append(&ep->aios, aio);
+	if (aio == nni_list_first(&ep->aios)) {
+		nni_ws_listener_accept(ep->listener, ep->accaio);
 	}
 	nni_mtx_unlock(&ep->mtx);
 }
@@ -503,9 +421,12 @@ ws_ep_fini(void *arg)
 {
 	ws_ep *ep = arg;
 
-	if (ep->connaio) {
-		nni_aio_stop(ep->connaio);
-		nni_aio_fini(ep->connaio);
+	nni_aio_stop(ep->accaio);
+	nni_aio_stop(ep->connaio);
+	nni_aio_fini(ep->accaio);
+	nni_aio_fini(ep->connaio);
+	if (ep->listener) {
+		nni_ws_listener_fini(ep->listener);
 	}
 	nni_strfree(ep->path);
 	nni_strfree(ep->host);
@@ -559,6 +480,41 @@ ws_ep_close(void *arg)
 		nni_aio_cancel(ep->connaio, NNG_ECLOSED);
 		// XXX: Close the client?
 	}
+}
+
+static void
+ws_ep_acc_cb(void *arg)
+{
+	ws_ep *  ep   = arg;
+	nni_aio *aaio = ep->accaio;
+	nni_aio *uaio;
+	int      rv;
+
+	nni_mtx_lock(&ep->mtx);
+	uaio = nni_list_first(&ep->aios);
+	if ((rv = nni_aio_result(aaio)) != 0) {
+		if (uaio != NULL) {
+			nni_aio_list_remove(uaio);
+			nni_aio_finish_error(uaio, rv);
+		}
+	} else {
+		nni_ws *ws = nni_aio_get_pipe(aaio);
+		if (uaio != NULL) {
+			ws_pipe *p;
+			// Make a pipe
+			nni_aio_list_remove(uaio);
+			if ((rv = ws_pipe_init(&p, ep, ws)) != 0) {
+				nni_ws_close(ws);
+				nni_aio_finish_error(uaio, rv);
+			} else {
+				nni_aio_finish_pipe(uaio, p);
+			}
+		}
+	}
+	if (!nni_list_empty(&ep->aios)) {
+		nni_ws_listener_accept(ep->listener, aaio);
+	}
+	nni_mtx_unlock(&ep->mtx);
 }
 
 static int
@@ -661,6 +617,11 @@ ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 			rv = nni_aio_init(&ep->connaio, ws_ep_conn_cb, ep);
 		}
 	} else {
+		// XXX: come back here!
+		rv = nni_aio_init(&ep->accaio, ws_ep_acc_cb, ep);
+		// XXX: listener init
+		rv = nni_ws_listener_init(&ep->listener, url);
+
 		(void) snprintf(ep->protoname, sizeof(ep->protoname),
 		    "%s.sp.nanomsg.org", nni_sock_proto_name(sock));
 		// We actually don't support query parameters, so nuke
