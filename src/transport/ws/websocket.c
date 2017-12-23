@@ -14,9 +14,7 @@
 #include <string.h>
 
 #include "core/nng_impl.h"
-#include "supplemental/base64/base64.h"
 #include "supplemental/http/http.h"
-#include "supplemental/sha1/sha1.h"
 #include "supplemental/websocket/websocket.h"
 
 typedef struct ws_ep   ws_ep;
@@ -30,48 +28,21 @@ struct ws_ep {
 	size_t           rcvmax;
 	char *           host;
 	char *           serv;
-	char *           path;
 	nni_http_client *client; // only one of client or server is valid
-	nni_http_server *server;
-	nni_http_handler handler; // server only
 	char             protoname[64];
-	nni_list         ready;
-	nni_list         active;
 	nni_list         aios;
 	nni_mtx          mtx;
 	nni_aio *        connaio;
 	nni_aio *        accaio;
 
 	nni_ws_listener *listener;
+	nni_ws_dialer *  dialer;
 };
-
-// The most we will send in a single fragment.  We leave this pretty large,
-// because if it is small the receiver will wind up having to reallocate
-// messages a lot, and that is expensive.  If the value is *too* large,
-// then the latency on handling control frames may become rather large.
-// (Browsers and servers that send PING requests may become unhappy if it
-// takes too long for them to get a PONG reply.)
-#define WS_FRAGMENT_SIZE (1U << 20)
-
-// WS_FRAGMENT_PREALLOC is used to indicate that we should preallocate
-// data in this chunk size, when receiving a fragmented frame.  (Meaning,
-// we will allocate this much extra at a time).  Large values can impact
-// memory consumption negatively.  Small values will cause extra data copying
-// and reallocations.  We only do this large preallocation once.  (So
-// sending very large fragmented frames with websocket is going to have
-// pretty poor performance.  This is a deficiency in the SP over websocket
-// protocol -- we really would like to have the actual message size supplied.)
-#define WS_FRAGMENT_PREALLOC (1U << 20)
-
-#define WS_KEY_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-#define WS_KEY_GUIDLEN 36
 
 struct ws_pipe {
 	int           mode; // NNI_EP_MODE_DIAL or NNI_EP_MODE_LISTEN
 	nni_list_node node;
-	ws_ep *       ep;
 	nni_mtx       mtx;
-	nni_http *    http; // http transport
 
 	size_t rcvmax; // inherited from EP
 
@@ -84,9 +55,6 @@ struct ws_pipe {
 
 	nni_aio *txaio;
 	nni_aio *rxaio;
-
-	nni_http_req *req;
-	nni_http_res *res;
 
 	nni_ws *ws;
 };
@@ -208,19 +176,9 @@ ws_pipe_fini(void *arg)
 	nni_aio_stop(p->rxaio);
 	nni_aio_stop(p->txaio);
 
-	if (p->http) {
-		nni_http_fini(p->http);
-	}
-
 	nni_aio_fini(p->rxaio);
 	nni_aio_fini(p->txaio);
 
-	if (p->req) {
-		nni_http_req_fini(p->req);
-	}
-	if (p->res) {
-		nni_http_res_fini(p->res);
-	}
 	if (p->ws) {
 		nni_ws_fini(p->ws);
 	}
@@ -263,15 +221,12 @@ ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *http)
 	p->mode   = ep->mode;
 	p->rcvmax = ep->rcvmax;
 	//	p->addr   = ep->addr;
-	p->http   = http;
 	p->rproto = ep->rproto;
 	p->lproto = ep->lproto;
 
 	nni_mtx_lock(&ep->mtx);
-	p->ep = ep;
 	if ((aio = nni_list_first(&ep->aios)) != NULL) {
 		nni_aio_list_remove(aio);
-		nni_list_append(&ep->active, p);
 		nni_aio_finish_pipe(aio, p);
 	}
 	nni_mtx_unlock(&ep->mtx);
@@ -428,7 +383,6 @@ ws_ep_fini(void *arg)
 	if (ep->listener) {
 		nni_ws_listener_fini(ep->listener);
 	}
-	nni_strfree(ep->path);
 	nni_strfree(ep->host);
 	nni_strfree(ep->serv);
 	nni_mtx_fini(&ep->mtx);
@@ -524,7 +478,6 @@ ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 	char         buf[NNG_MAXADDRLEN + 1];
 	char *       path;
 	char *       pair;
-	char *       qparams;
 	bool         https = false;
 	nni_aio *    aio;
 	nng_sockaddr sa;
@@ -551,11 +504,6 @@ ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 	} else {
 		path = "/";
 	}
-	if ((qparams = strchr(path, '?')) != NULL) {
-		// We do not support query parameters.  (A peer client
-		// can still send them, we just will ignore them.)
-		*qparams = '\0';
-	}
 
 	// Empty path is /
 	if (path[0] == '\0') {
@@ -569,8 +517,6 @@ ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 	nni_mtx_init(&ep->mtx);
 
 	// List of pipes (server only).
-	NNI_LIST_INIT(&ep->ready, ws_pipe, node);
-	NNI_LIST_INIT(&ep->active, ws_pipe, node);
 	nni_aio_list_init(&ep->aios);
 
 	ep->mode   = mode;
@@ -578,11 +524,6 @@ ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 	ep->rproto = nni_sock_peer(sock);
 
 	nni_strlcpy(ep->addr, url, sizeof(ep->addr));
-	if ((ep->path = nni_strdup(path)) == NULL) {
-		// Full path, may include Query Parameters.
-		ws_ep_fini(ep);
-		return (NNG_ENOMEM);
-	}
 
 	if ((rv = nni_tran_parse_host_port(pair, &ep->host, &ep->serv)) != 0) {
 		ws_ep_fini(ep);
@@ -624,11 +565,6 @@ ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 
 		(void) snprintf(ep->protoname, sizeof(ep->protoname),
 		    "%s.sp.nanomsg.org", nni_sock_proto_name(sock));
-		// We actually don't support query parameters, so nuke
-		// them. (This is only for registration.  The client
-		// can still supply them, and we will match and pass to
-		// the handler.)
-		rv = nni_http_server_init(&ep->server, &sa);
 	}
 
 	if (rv != 0) {
