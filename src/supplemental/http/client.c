@@ -43,19 +43,23 @@ http_conn_done(void *arg)
 	nni_http *         http;
 
 	nni_mtx_lock(&c->mtx);
-	if (nni_aio_result(c->connaio) != 0) {
-		nni_plat_tcp_ep_close(c->tep);
+	rv = nni_aio_result(c->connaio);
+	p  = rv == 0 ? nni_aio_get_pipe(c->connaio) : NULL;
+	if ((aio = nni_list_first(&c->aios)) == NULL) {
+		if (p != NULL) {
+			nni_plat_tcp_pipe_fini(p);
+		}
 		nni_mtx_unlock(&c->mtx);
 		return;
 	}
-	p = nni_aio_get_pipe(c->connaio);
-	if ((aio = nni_list_first(&c->aios)) == NULL) {
-		nni_plat_tcp_pipe_fini(p);
+	nni_aio_list_remove(aio);
+
+	if (rv != 0) {
+		nni_aio_finish_error(aio, rv);
 		nni_mtx_unlock(&c->mtx);
 		return;
 	}
 
-	nni_aio_list_remove(aio);
 	t.h_data  = p;
 	t.h_write = (void *) nni_plat_tcp_pipe_send;
 	t.h_read  = (void *) nni_plat_tcp_pipe_recv;

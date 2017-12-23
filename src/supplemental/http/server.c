@@ -364,10 +364,10 @@ http_sconn_rxdone(void *arg)
 			// a lone trailing dot, so that is ok too.
 
 			// Ignore the trailing dot if the handler supplied it.
+			len = strlen(h->h_host);
 			if ((len > 0) && (h->h_host[len - 1] == '.')) {
 				len--;
 			}
-			len = strlen(h->h_host);
 			if ((nni_strncasecmp(val, h->h_host, len) != 0)) {
 				continue;
 			}
@@ -833,6 +833,7 @@ http_server_add_handler(void **hp, nni_http_server *s, nni_http_handler *hh,
 		}
 		if (strncmp(h2->h_path, h->h_path, l2) == 0) {
 			// Path collision.  NNG_EADDRINUSE.
+			nni_mtx_unlock(&s->mtx);
 			http_handler_fini(h);
 			return (NNG_EADDRINUSE);
 		}

@@ -42,7 +42,7 @@ TestMain("HTTP Client", {
 		iaio         = (nni_aio *) aio;
 		iaio->a_addr = &rsa;
 
-		nng_aio_set_timeout(aio, nni_clock() + 10000);
+		nng_aio_set_timeout(aio, 1000);
 		nni_plat_tcp_resolv("httpbin.org", "80", NNG_AF_INET, 0, iaio);
 		nng_aio_wait(aio);
 		So(nng_aio_result(aio) == 0);

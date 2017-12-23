@@ -14,7 +14,6 @@
 #include <string.h>
 
 #include "core/nng_impl.h"
-#include "supplemental/http/http.h"
 #include "supplemental/websocket/websocket.h"
 
 typedef struct ws_ep   ws_ep;
@@ -22,41 +21,31 @@ typedef struct ws_pipe ws_pipe;
 
 struct ws_ep {
 	int              mode; // NNI_EP_MODE_DIAL or NNI_EP_MODE_LISTEN
-	char             addr[NNG_MAXADDRLEN + 1];
+	char *           addr;
 	uint16_t         lproto; // local protocol
 	uint16_t         rproto; // remote protocol
 	size_t           rcvmax;
-	char *           host;
-	char *           serv;
-	nni_http_client *client; // only one of client or server is valid
-	char             protoname[64];
+	char *           protoname;
 	nni_list         aios;
 	nni_mtx          mtx;
 	nni_aio *        connaio;
 	nni_aio *        accaio;
-
 	nni_ws_listener *listener;
 	nni_ws_dialer *  dialer;
 };
 
 struct ws_pipe {
-	int           mode; // NNI_EP_MODE_DIAL or NNI_EP_MODE_LISTEN
-	nni_list_node node;
-	nni_mtx       mtx;
-
-	size_t rcvmax; // inherited from EP
-
+	int      mode; // NNI_EP_MODE_DIAL or NNI_EP_MODE_LISTEN
+	nni_mtx  mtx;
+	size_t   rcvmax; // inherited from EP
 	bool     closed;
 	uint16_t rproto;
 	uint16_t lproto;
-
 	nni_aio *user_txaio;
 	nni_aio *user_rxaio;
-
 	nni_aio *txaio;
 	nni_aio *rxaio;
-
-	nni_ws *ws;
+	nni_ws * ws;
 };
 
 static void
@@ -197,7 +186,7 @@ ws_pipe_close(void *arg)
 }
 
 static int
-ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *http)
+ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *ws)
 {
 	ws_pipe *p;
 	int      rv;
@@ -209,9 +198,6 @@ ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *http)
 	nni_mtx_init(&p->mtx);
 
 	// Initialize AIOs.
-	// The closeaio has no callback, but we do "wait" for it in the
-	// finish handler -- it has a strict timeout to ensure that we
-	// get the message out if at all possible.
 	if (((rv = nni_aio_init(&p->txaio, ws_pipe_send_cb, p)) != 0) ||
 	    ((rv = nni_aio_init(&p->rxaio, ws_pipe_recv_cb, p)) != 0)) {
 		ws_pipe_fini(p);
@@ -220,9 +206,10 @@ ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *http)
 
 	p->mode   = ep->mode;
 	p->rcvmax = ep->rcvmax;
-	//	p->addr   = ep->addr;
+	// p->addr   = ep->addr;
 	p->rproto = ep->rproto;
 	p->lproto = ep->lproto;
+	p->ws     = ws;
 
 	nni_mtx_lock(&ep->mtx);
 	if ((aio = nni_list_first(&ep->aios)) != NULL) {
@@ -284,7 +271,7 @@ ws_ep_accept(void *arg, nni_aio *aio)
 	// pipe (created by the handler), and match it.
 	// Otherwise we stick the AIO in the accept list.
 	nni_mtx_lock(&ep->mtx);
-	if (!nni_aio_start(aio, ws_ep_cancel, ep)) {
+	if (nni_aio_start(aio, ws_ep_cancel, ep) != 0) {
 		nni_mtx_unlock(&ep->mtx);
 		return;
 	}
@@ -312,7 +299,7 @@ ws_ep_connect(void *arg, nni_aio *aio)
 	}
 
 	nni_list_append(&ep->aios, aio);
-	nni_http_client_connect(ep->client, ep->connaio);
+	nni_ws_dialer_dial(ep->dialer, ep->connaio);
 	nni_mtx_unlock(&ep->mtx);
 }
 
@@ -360,13 +347,6 @@ static nni_tran_ep_option ws_ep_options[] = {
 	    .eo_getopt = ws_ep_getopt_recvmaxsz,
 	    .eo_setopt = ws_ep_setopt_recvmaxsz,
 	},
-#if 0
-	{
-	    .eo_name   = NNG_OPT_LINGER,
-	    .eo_getopt = ws_ep_getopt_linger,
-	    .eo_setopt = ws_ep_setopt_linger,
-	},
-#endif
 	// terminate list
 	{ NULL, NULL, NULL },
 };
@@ -380,11 +360,13 @@ ws_ep_fini(void *arg)
 	nni_aio_stop(ep->connaio);
 	nni_aio_fini(ep->accaio);
 	nni_aio_fini(ep->connaio);
-	if (ep->listener) {
+	if (ep->listener != NULL) {
 		nni_ws_listener_fini(ep->listener);
 	}
-	nni_strfree(ep->host);
-	nni_strfree(ep->serv);
+	if (ep->dialer != NULL) {
+		nni_ws_dialer_fini(ep->dialer);
+	}
+	nni_strfree(ep->addr);
 	nni_mtx_fini(&ep->mtx);
 	NNI_FREE_STRUCT(ep);
 }
@@ -392,29 +374,31 @@ ws_ep_fini(void *arg)
 static void
 ws_ep_conn_cb(void *arg)
 {
-	ws_ep *   ep = arg;
-	ws_pipe * p;
-	nni_aio * aio = ep->connaio;
-	nni_aio * uaio;
-	nni_http *http = NULL;
-	int       rv;
+	ws_ep *  ep = arg;
+	ws_pipe *p;
+	nni_aio *caio = ep->connaio;
+	nni_aio *uaio;
+	int      rv;
+	nni_ws * ws = NULL;
 
 	nni_mtx_lock(&ep->mtx);
-	if (nni_aio_result(aio) == 0) {
-		http = nni_aio_get_output(aio, 0);
+	if (nni_aio_result(caio) == 0) {
+		ws = nni_aio_get_pipe(caio);
 	}
 	if ((uaio = nni_list_first(&ep->aios)) == NULL) {
 		// The client stopped caring about this!
-		if (http != NULL) {
-			nni_http_fini(http);
+		if (ws != NULL) {
+			nni_ws_fini(ws);
 		}
+		nni_mtx_unlock(&ep->mtx);
 		return;
 	}
 	nni_aio_list_remove(uaio);
-	if ((rv = nni_aio_result(aio)) != 0) {
+	NNI_ASSERT(nni_list_empty(&ep->aios));
+	if ((rv = nni_aio_result(caio)) != 0) {
 		nni_aio_finish_error(uaio, rv);
-	} else if ((rv = ws_pipe_init(&p, ep, http)) != 0) {
-		nni_http_fini(http);
+	} else if ((rv = ws_pipe_init(&p, ep, ws)) != 0) {
+		nni_ws_fini(ws);
 		nni_aio_finish_error(uaio, rv);
 	} else {
 		nni_aio_finish_pipe(uaio, p);
@@ -425,14 +409,12 @@ ws_ep_conn_cb(void *arg)
 static void
 ws_ep_close(void *arg)
 {
-	ws_ep *ep;
+	ws_ep *ep = arg;
 
-	// We need to remove ourself from the http servers list.
 	if (ep->mode == NNI_EP_MODE_LISTEN) {
-		// XXX: delete handler
+		nni_ws_listener_close(ep->listener);
 	} else {
-		nni_aio_cancel(ep->connaio, NNG_ECLOSED);
-		// XXX: Close the client?
+		nni_ws_dialer_close(ep->dialer);
 	}
 }
 
@@ -474,41 +456,9 @@ ws_ep_acc_cb(void *arg)
 static int
 ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 {
-	ws_ep *      ep;
-	char         buf[NNG_MAXADDRLEN + 1];
-	char *       path;
-	char *       pair;
-	bool         https = false;
-	nni_aio *    aio;
-	nng_sockaddr sa;
-	int          rv;
-
-	if (nni_strlcpy(buf, url, sizeof(buf)) >= sizeof(buf)) {
-		return (NNG_EADDRINVAL);
-	}
-
-	if (strncmp(buf, "ws://", strlen("ws://"))) {
-		https = false;
-		pair  = buf + strlen("ws://");
-	} else if (strncmp(buf, "wss://", strlen("wss://"))) {
-		https = true;
-		pair  = buf + strlen("wss://");
-		return (NNG_ENOTSUP); // NO TLS support yet.
-	} else {
-		return (NNG_EADDRINVAL);
-	}
-
-	if ((path = strchr(pair, '/')) != NULL) {
-		*path = '\0';
-		path++;
-	} else {
-		path = "/";
-	}
-
-	// Empty path is /
-	if (path[0] == '\0') {
-		path = "/";
-	}
+	ws_ep *     ep;
+	const char *pname;
+	int         rv;
 
 	if ((ep = NNI_ALLOC_STRUCT(ep)) == NULL) {
 		return (NNG_ENOMEM);
@@ -523,56 +473,38 @@ ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 	ep->lproto = nni_sock_proto(sock);
 	ep->rproto = nni_sock_peer(sock);
 
-	nni_strlcpy(ep->addr, url, sizeof(ep->addr));
-
-	if ((rv = nni_tran_parse_host_port(pair, &ep->host, &ep->serv)) != 0) {
-		ws_ep_fini(ep);
-		return (rv);
-	}
-	if (ep->serv == NULL) {
-		if ((ep->serv = nni_strdup(https ? "443" : "80")) == NULL) {
-			ws_ep_fini(ep);
-			return (NNG_ENOMEM);
-		}
-	}
-
-	if ((rv = nni_aio_init(&aio, NULL, NULL)) != 0) {
-		ws_ep_fini(ep);
-		return (rv);
-	}
-	aio->a_addr = &sa;
-	nni_plat_tcp_resolv(ep->host, ep->serv, NNG_AF_UNSPEC,
-	    mode == NNI_EP_MODE_DIAL ? false : true, aio);
-	nni_aio_wait(aio);
-	rv = nni_aio_result(aio);
-	nni_aio_fini(aio);
-	if (rv != 0) {
-		return (rv);
-	}
-
 	if (mode == NNI_EP_MODE_DIAL) {
-		(void) snprintf(ep->protoname, sizeof(ep->protoname),
-		    "%s.sp.nanomsg.org", nni_sock_peer_name(sock));
-		rv = nni_http_client_init(&ep->client, &sa);
-		if (rv == 0) {
-			rv = nni_aio_init(&ep->connaio, ws_ep_conn_cb, ep);
-		}
+		pname = nni_sock_peer_name(sock);
+		rv    = nni_ws_dialer_init(&ep->dialer, url);
 	} else {
-		// XXX: come back here!
-		rv = nni_aio_init(&ep->accaio, ws_ep_acc_cb, ep);
-		// XXX: listener init
-		rv = nni_ws_listener_init(&ep->listener, url);
-
-		(void) snprintf(ep->protoname, sizeof(ep->protoname),
-		    "%s.sp.nanomsg.org", nni_sock_proto_name(sock));
+		pname = nni_sock_proto_name(sock);
+		rv    = nni_ws_listener_init(&ep->listener, url);
 	}
 
-	if (rv != 0) {
+	if ((rv == 0) && ((ep->addr = nni_strdup(url)) == NULL)) {
+		rv = NNG_ENOMEM;
+	}
+	if ((rv != 0) ||
+	    ((rv = nni_aio_init(&ep->connaio, ws_ep_conn_cb, ep)) != 0) ||
+	    ((rv = nni_aio_init(&ep->accaio, ws_ep_acc_cb, ep)) != 0) ||
+	    ((rv = nni_asprintf(&ep->protoname, "%s.sp.nanomsg.org", pname)) !=
+	        0)) {
 		ws_ep_fini(ep);
 		return (rv);
 	}
+
 	*epp = ep;
 	return (0);
+}
+static int
+ws_tran_init(void)
+{
+	return (0);
+}
+
+static void
+ws_tran_fini(void)
+{
 }
 
 static nni_tran_ep ws_ep_ops = {
@@ -590,8 +522,8 @@ static nni_tran ws_tran = {
 	.tran_scheme  = "ws",
 	.tran_ep      = &ws_ep_ops,
 	.tran_pipe    = &ws_pipe_ops,
-	.tran_init    = NULL,
-	.tran_fini    = NULL,
+	.tran_init    = ws_tran_init,
+	.tran_fini    = ws_tran_fini,
 };
 
 int

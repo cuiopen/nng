@@ -13,6 +13,7 @@
 #include "transport/ipc/ipc.h"
 #include "transport/tcp/tcp.h"
 #include "transport/tls/tls.h"
+#include "transport/ws/websocket.h"
 #include "transport/zerotier/zerotier.h"
 
 #include <stdio.h>
@@ -220,8 +221,11 @@ static nni_tran_ctor nni_tran_ctors[] = {
 #ifdef NNG_HAVE_TLS
 	nng_tls_register,
 #endif
-#ifdef NNI_HAVE_ZEROTIER
+#ifdef NNG_HAVE_ZEROTIER
 	nng_zt_register,
+#endif
+#ifdef NNG_HAVE_WEBSOCKET
+	nng_ws_register,
 #endif
 	NULL,
 };

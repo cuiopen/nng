@@ -64,9 +64,16 @@ struct nni_ws_listener {
 	void *             hookarg;
 };
 
+// The dialer tracks user aios in two lists. The first list is for aios
+// waiting for the http connection to be established, while the second
+// are waiting for the HTTP negotiation to complete.  We keep two lists
+// so we know whether to initiate another outgoing connection after the
+// completion of an earlier connection.  (We don't want to establish
+// requests when we already have connects negotiating.)
 struct nni_ws_dialer {
 	nni_tls_config * tls;
 	nni_http_req *   req;
+	nni_http_res *   res;
 	nni_http_client *client;
 	nni_mtx          mtx;
 	nni_aio *        conaio;
@@ -75,8 +82,10 @@ struct nni_ws_dialer {
 	char *           serv;
 	char *           path;
 	char *           qinfo;
-	char *           url;
-	nni_list         aios;
+	char *           addr;     // full address (a URL really)
+	char *           uri;      // path + query
+	nni_list         conaios;  // user aios waiting for connect.
+	nni_list         httpaios; // user aios waiting for HTTP nego.
 	bool             started;
 	bool             closed;
 	nng_sockaddr     sa;
@@ -127,6 +136,59 @@ struct ws_msg {
 };
 
 static void ws_send_close(nni_ws *ws, uint16_t code);
+
+// This looks, case independently for a word in a list, which is either
+// space or comma separated.
+static bool
+ws_contains_word(const char *phrase, const char *word)
+{
+	size_t len = strlen(word);
+
+	while ((phrase != NULL) && (*phrase != '\0')) {
+		if ((nni_strncasecmp(phrase, word, len) == 0) &&
+		    ((phrase[len] == 0) || (phrase[len] == ' ') ||
+		        (phrase[len] == ','))) {
+			return (true);
+		}
+		// Skip to next word.
+		if ((phrase = strchr(phrase, ' ')) != NULL) {
+			while ((*phrase == ' ') || (*phrase == ',')) {
+				phrase++;
+			}
+		}
+	}
+	return (false);
+}
+
+// input is base64 challenge, output is the accepted.  input should be
+// 24 character base 64, output is 28 character base64 reply.  (output
+// must be large enough to hold 29 bytes to allow for termination.)
+// Returns 0 on success, NNG_EINVAL if the input is malformed somehow.
+static int
+ws_make_accept(const char *key, char *accept)
+{
+	uint8_t      rawkey[16];
+	uint8_t      digest[20];
+	char         resp[29];
+	nni_sha1_ctx ctx;
+
+#define WS_KEY_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#define WS_KEY_GUIDLEN 36
+
+	if ((strlen(key) != 24) ||
+	    (nni_base64_decode(key, 24, rawkey, 16) != 16)) {
+		return (NNG_EINVAL);
+	}
+
+	nni_sha1_init(&ctx);
+	nni_sha1_update(&ctx, rawkey, 16);
+	nni_sha1_update(&ctx, (uint8_t *) WS_KEY_GUID, WS_KEY_GUIDLEN);
+	nni_sha1_final(&ctx, digest);
+
+	nni_base64_encode(digest, 20, accept, 28);
+	accept[28] = '\0';
+	return (0);
+}
 
 static void
 ws_frame_fini(ws_frame *frame)
@@ -970,12 +1032,11 @@ nni_ws_fini(nni_ws *ws)
 }
 
 static void
-ws_http_cb(void *arg)
+ws_http_cb_listener(nni_ws *ws, nni_aio *aio)
 {
-	// This is only done on the server/listener side.
-	nni_ws *         ws  = arg;
-	nni_aio *        aio = ws->httpaio;
-	nni_ws_listener *l   = nni_aio_get_data(aio, 0);
+	// This is only
+	nni_ws_listener *l;
+	l = nni_aio_get_data(aio, 0);
 
 	nni_mtx_lock(&l->mtx);
 	nni_list_remove(&l->reply, ws);
@@ -991,6 +1052,116 @@ ws_http_cb(void *arg)
 		nni_list_append(&l->pend, ws);
 	}
 	nni_mtx_unlock(&l->mtx);
+}
+
+static void
+ws_http_cb_dialer(nni_ws *ws, nni_aio *aio)
+{
+	nni_ws_dialer *d;
+	nni_aio *      uaio;
+	int            rv;
+	uint16_t       status;
+	char           wskey[29];
+	const char *   ptr;
+
+	d = nni_aio_get_data(aio, 0);
+
+	nni_mtx_lock(&d->mtx);
+	uaio = nni_list_first(&d->httpaios);
+	NNI_ASSERT(uaio != NULL);
+	// We have two steps.  In step 1, we just sent the request,
+	// and need to retrieve the reply.  In step two we have
+	// received the reply, and need to validate it.
+	if ((rv = nni_aio_result(aio)) != 0) {
+		goto err;
+	}
+
+	// If we have no response structure, then this was completion of the
+	// send of the request.  Prepare an empty response, and read it.
+	if (ws->res == NULL) {
+		if ((rv = nni_http_res_init(&ws->res)) != 0) {
+			goto err;
+		}
+		nni_http_read_res(ws->http, ws->res, ws->httpaio);
+		nni_mtx_unlock(&d->mtx);
+		return;
+	}
+
+	status = nni_http_res_get_status(ws->res);
+	switch (status) {
+	case NNI_HTTP_STATUS_SWITCHING:
+		break;
+	case NNI_HTTP_STATUS_FORBIDDEN:
+	case NNI_HTTP_STATUS_UNAUTHORIZED:
+		rv = NNG_EPERM;
+		goto err;
+	case NNI_HTTP_STATUS_NOT_FOUND:
+	case NNI_HTTP_STATUS_METHOD_NOT_ALLOWED:
+		rv = NNG_ECONNREFUSED; // Treat these as refusals.
+		goto err;
+	case NNI_HTTP_STATUS_BAD_REQUEST:
+	default:
+		// Perhaps we should use NNG_ETRANERR...
+		rv = NNG_EPROTO;
+		goto err;
+	}
+
+	// Check that the server gave us back the right key.
+	rv = ws_make_accept(
+	    nni_http_req_get_header(ws->req, "Sec-WebSocket-Key"), wskey);
+	if (rv != 0) {
+		goto err;
+	}
+
+#define GETH(h) nni_http_res_get_header(ws->res, h)
+
+	if (((ptr = GETH("Sec-WebSocket-Accept")) == NULL) ||
+	    (strcmp(ptr, wskey) != 0) ||
+	    ((ptr = GETH("Connection")) != NULL) ||
+	    (!ws_contains_word(ptr, "upgrade")) ||
+	    ((ptr = GETH("Upgrade")) != NULL) ||
+	    (strcmp(ptr, "websocket") != 0)) {
+		nni_ws_close_error(ws, WS_CLOSE_PROTOCOL_ERR);
+		rv = NNG_EPROTO;
+		goto err;
+	}
+	if (d->proto != NULL) {
+		if (((ptr = GETH("Sec-WebSocket-Protocol")) == NULL) ||
+		    (!ws_contains_word(d->proto, ptr))) {
+			nni_ws_close_error(ws, WS_CLOSE_PROTOCOL_ERR);
+			rv = NNG_EPROTO;
+			goto err;
+		}
+	}
+#undef GETH
+
+	// At this point, we are in business!
+	nni_aio_list_remove(uaio);
+	nni_aio_finish_pipe(uaio, ws);
+	nni_mtx_unlock(&d->mtx);
+	return;
+err:
+	nni_aio_list_remove(uaio);
+	nni_aio_finish_error(uaio, rv);
+	nni_ws_fini(ws);
+	nni_mtx_unlock(&d->mtx);
+}
+
+static void
+ws_http_cb(void *arg)
+{
+	// This is only done on the server/listener side.
+	nni_ws * ws  = arg;
+	nni_aio *aio = ws->httpaio;
+
+	switch (ws->mode) {
+	case NNI_EP_MODE_LISTEN:
+		ws_http_cb_listener(ws, aio);
+		break;
+	case NNI_EP_MODE_DIAL:
+		ws_http_cb_dialer(ws, aio);
+		break;
+	}
 }
 
 static int
@@ -1035,62 +1206,6 @@ nni_ws_listener_fini(nni_ws_listener *l)
 	NNI_FREE_STRUCT(l);
 }
 
-#define WS_KEY_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-#define WS_KEY_GUIDLEN 36
-
-// input is base64 challenge, output is the accepted.  input should be
-// 24 character base 64, output is 28 character base64 reply.  (output
-// must be large enough to hold 29 bytes to allow for termination.)
-// Returns 0 on success, NNG_EINVAL if the input is malformed somehow.
-static int
-ws_make_accept(const char *key, char *accept)
-{
-	uint8_t      rawkey[16];
-	uint8_t      digest[20];
-	char         resp[29];
-	nni_sha1_ctx ctx;
-
-	if ((strlen(key) != 24) ||
-	    (nni_base64_decode(key, 24, rawkey, 16) != 16)) {
-		return (NNG_EINVAL);
-	}
-
-	nni_sha1_init(&ctx);
-	nni_sha1_update(&ctx, rawkey, 16);
-	nni_sha1_update(&ctx, (uint8_t *) WS_KEY_GUID, WS_KEY_GUIDLEN);
-	nni_sha1_final(&ctx, digest);
-
-	nni_base64_encode(digest, 20, accept, 28);
-	accept[28] = '\0';
-	return (0);
-}
-
-// This looks, case independently for a word in a list, which is either
-// space or comma separated.
-static bool
-ws_contains_word(const char *phrase, const char *word)
-{
-	size_t len = strlen(word);
-
-	while ((phrase != NULL) && (*phrase != '\0')) {
-		if ((nni_strncasecmp(phrase, word, len) == 0) &&
-		    ((phrase[len] == 0) || (phrase[len] == ' ') ||
-		        (phrase[len] == ','))) {
-			return (true);
-		}
-		// Skip to next word.
-		if ((phrase = strchr(phrase, ' ')) != NULL) {
-			while ((*phrase == ' ') || (*phrase == ',')) {
-				phrase++;
-			}
-		}
-	}
-	return (false);
-}
-
-#define GETH(h) nni_http_req_get_header(req, h)
-#define SETH(h, v) nni_http_res_set_header(res, h, v)
-
 static void
 ws_handler(nni_aio *aio)
 {
@@ -1120,6 +1235,9 @@ ws_handler(nni_aio *aio)
 		status = NNI_HTTP_STATUS_BAD_REQUEST;
 		goto err;
 	}
+
+#define GETH(h) nni_http_req_get_header(req, h)
+#define SETH(h, v) nni_http_res_set_header(res, h, v)
 
 	if ((((ptr = GETH("Content-Length")) != NULL) && (atoi(ptr) > 0)) ||
 	    (((ptr = GETH("Transfer-Encoding")) != NULL) &&
@@ -1211,6 +1329,9 @@ ws_handler(nni_aio *aio)
 		}
 	}
 
+#undef GETH
+#undef SETH
+
 	// We are good to go, provided we can get the websocket struct,
 	// and send the reply.
 	if ((rv = ws_init(&ws, http, req, res)) != 0) {
@@ -1218,6 +1339,7 @@ ws_handler(nni_aio *aio)
 		status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 		goto err;
 	}
+	ws->mode = NNI_EP_MODE_LISTEN;
 
 	// XXX: Inherit fragmentation and message size limits!
 
@@ -1238,9 +1360,6 @@ err:
 		nni_aio_finish(aio, 0, 0);
 	}
 }
-#undef GETH
-#undef SETH
-
 static int
 ws_parse_url(const char *url, char **schemep, char **hostp, char **servp,
     char **pathp, char **queryp)
@@ -1260,6 +1379,7 @@ ws_parse_url(const char *url, char **schemep, char **hostp, char **servp,
 	if ((scr = nni_alloc(scrlen)) == NULL) {
 		return (NNG_ENOMEM);
 	}
+	nni_strlcpy(scr, url, scrlen);
 	scheme = scr;
 	pair   = strchr(scr, ':');
 	if ((pair == NULL) || (pair[1] != '/') || (pair[2] != '/')) {
@@ -1291,7 +1411,12 @@ ws_parse_url(const char *url, char **schemep, char **hostp, char **servp,
 	if (path) {
 		// Restore the path, and trim off the query parameter.
 		*path = '/';
-		query = strchr(path, '?');
+		if ((query = strchr(path, '?')) != NULL) {
+			*query = '\0';
+			query++;
+		} else {
+			query = "";
+		}
 	} else {
 		path  = "/";
 		query = "";
@@ -1332,10 +1457,6 @@ int
 nni_ws_listener_init(nni_ws_listener **wslp, const char *url)
 {
 	nni_ws_listener *l;
-	char *           scr;
-	char *           pair;
-	char *           path;
-	size_t           scrlen;
 	int              rv;
 
 	if ((l = NNI_ALLOC_STRUCT(l)) == NULL) {
@@ -1347,40 +1468,11 @@ nni_ws_listener_init(nni_ws_listener **wslp, const char *url)
 	NNI_LIST_INIT(&l->pend, nni_ws, node);
 	NNI_LIST_INIT(&l->reply, nni_ws, node);
 
-	// We need a scratch copy of the url to parse.
-	scrlen = strlen(url) + 1;
-	if ((scr = nni_alloc(scrlen)) == NULL) {
-		nni_ws_listener_fini(l);
-		return (NNG_ENOMEM);
-	}
-	if ((pair = strstr(scr, "://")) == NULL) {
-		nni_ws_listener_fini(l);
-		nni_free(scr, scrlen);
-		return (NNG_ENOMEM);
-	}
-	pair += strlen("://");
-	path = strchr(pair, '/');
-	if (path == NULL) {
-		path = "/";
-	} else {
-		char *qp;
-		// Strip of query parameters.  (Caller shouldn't give us.)
-		if ((qp = strchr(path, '?')) != NULL) {
-			*qp = '\0';
-		}
-	}
-	if ((l->path = nni_strdup(path)) == NULL) {
-		nni_free(scr, scrlen);
-		nni_ws_listener_fini(l);
-		return (NNG_ENOMEM);
-	}
-	if ((rv = nni_tran_parse_host_port(pair, &l->host, &l->serv)) != 0) {
-		nni_free(scr, scrlen);
+	rv = ws_parse_url(url, NULL, &l->host, &l->serv, &l->path, NULL);
+	if (rv != 0) {
 		nni_ws_listener_fini(l);
 		return (rv);
 	}
-	nni_free(scr, scrlen); // done with this
-
 	l->handler.h_is_dir      = false;
 	l->handler.h_is_upgrader = true;
 	l->handler.h_method      = "GET";
@@ -1462,6 +1554,7 @@ nni_ws_listener_close(nni_ws_listener *l)
 	nni_mtx_lock(&l->mtx);
 	if (l->closed) {
 		nni_mtx_unlock(&l->mtx);
+		return;
 	}
 	l->closed = true;
 	if (l->server != NULL) {
@@ -1550,9 +1643,6 @@ nni_ws_listener_tls(nni_ws_listener *l, nni_tls_config *tls)
 	// We need to add this later.
 }
 
-#define GETH(h) nni_http_res_get_header(res, h)
-#define SETH(h, v) nni_http_req_set_header(req, h, v)
-
 void
 ws_conn_cb(void *arg)
 {
@@ -1561,39 +1651,35 @@ ws_conn_cb(void *arg)
 	nni_aio *      uaio;
 	nni_http *     http;
 	nni_http_req * req = NULL;
-	char *         uri = NULL;
 	int            rv;
 	uint8_t        raw[16];
 	char           wskey[25];
 	nni_ws *       ws;
 
 	nni_mtx_lock(&d->mtx);
-	if ((rv = nni_aio_result(aio)) != 0) {
-		// Go ahead and abort all of them.  Theoretically we could
-		// abort just one, but if one fails, all should, and the
-		// semantic is still correct.
-		while ((uaio = nni_list_first(&d->aios)) != NULL) {
-			nni_aio_list_remove(uaio);
-			nni_aio_finish_error(uaio, rv);
+	uaio = nni_list_first(&d->conaios);
+	rv   = nni_aio_result(aio);
+	http = rv == 0 ? nni_aio_get_output(aio, 0) : NULL;
+
+	if (uaio == NULL) {
+		if (http) {
+			// Nobody listening anymore - hard abort.
+			nni_http_fini(http);
 		}
-		nni_mtx_unlock(&d->mtx);
-		return;
-	}
-	http = nni_aio_get_output(aio, 0);
-	if ((uaio = nni_list_first(&d->aios)) == NULL) {
-		// User connect canceled?
-		nni_http_fini(http);
 		nni_mtx_unlock(&d->mtx);
 		return;
 	}
 
-	if (d->qinfo && d->qinfo[0] != '\0') {
-		rv = nni_asprintf(&uri, "%s?%s", d->path, d->qinfo);
-		if (rv != 0) {
-			goto err;
-		}
-	} else if ((uri = nni_strdup(d->path)) == NULL) {
-		rv = NNG_ENOMEM;
+	nni_aio_list_remove(uaio);
+	nni_aio_set_output(aio, 0, NULL);
+
+	// We are done with this aio, start another connection request while
+	// we finish up, if we have more clients waiting.
+	if (!nni_list_empty(&d->conaios)) {
+		nni_http_client_connect(d->client, aio);
+	}
+
+	if (rv != 0) {
 		goto err;
 	}
 
@@ -1603,8 +1689,15 @@ ws_conn_cb(void *arg)
 	nni_base64_encode(raw, 16, wskey, 24);
 	wskey[24] = '\0';
 
-	if (((rv = nni_http_req_init(&req)) != 0) ||
-	    ((rv = nni_http_req_set_uri(req, uri)) != 0) ||
+	if (d->qinfo && d->qinfo[0] != '\0') {
+		rv = nni_asprintf(&d->uri, "%s?%s", d->path, d->qinfo);
+	} else if ((d->uri = nni_strdup(d->path)) == NULL) {
+		rv = NNG_ENOMEM;
+	}
+
+#define SETH(h, v) nni_http_req_set_header(req, h, v)
+	if ((rv != 0) || ((rv = nni_http_req_init(&req)) != 0) ||
+	    ((rv = nni_http_req_set_uri(req, d->uri)) != 0) ||
 	    ((rv = nni_http_req_set_version(req, "HTTP/1.1")) != 0) ||
 	    ((rv = nni_http_req_set_method(req, "GET")) != 0) ||
 	    ((rv = SETH("Host", d->host)) != 0) ||
@@ -1620,18 +1713,28 @@ ws_conn_cb(void *arg)
 	    ((rv = SETH("Sec-WebSocket-Protocol", d->proto)) != 0)) {
 		goto err;
 	}
+#undef SETH
 
 	if ((rv = ws_init(&ws, http, req, NULL)) != 0) {
 		goto err;
 	}
+	ws->mode = NNI_EP_MODE_DIAL;
 
-	nni_aio_list_remove(uaio);
+	// Move this uaio to the http wait list.  Note that it is not
+	// required that the uaio will be completed by this connection.
+	// If another connection attempt completes first, then the first
+	// aio queued will get the result.
+	nni_list_append(&d->httpaios, uaio);
+	nni_aio_set_data(ws->httpaio, 0, d);
 	nni_http_write_req(http, req, ws->httpaio);
+	nni_mtx_unlock(&d->mtx);
+	return;
 
 err:
-	nni_aio_list_remove(uaio);
 	nni_aio_finish_error(uaio, rv);
-	nni_http_fini(http);
+	if (http != NULL) {
+		nni_http_fini(http);
+	}
 	nni_mtx_unlock(&d->mtx);
 }
 
@@ -1639,7 +1742,12 @@ void
 nni_ws_dialer_fini(nni_ws_dialer *d)
 {
 	nni_strfree(d->proto);
-	nni_strfree(d->url);
+	nni_strfree(d->addr);
+	nni_strfree(d->uri);
+	nni_strfree(d->host);
+	nni_strfree(d->serv);
+	nni_strfree(d->path);
+	nni_strfree(d->qinfo);
 	if (d->client) {
 		nni_http_client_fini(d->client);
 	}
@@ -1658,12 +1766,19 @@ nni_ws_dialer_init(nni_ws_dialer **dp, const char *url)
 		return (NNG_ENOMEM);
 	}
 	nni_mtx_init(&d->mtx);
-	if ((d->url = nni_strdup(url)) == NULL) {
+	nni_aio_list_init(&d->conaios);
+	nni_aio_list_init(&d->httpaios);
+
+	if ((d->addr = nni_strdup(url)) == NULL) {
 		nni_ws_dialer_fini(d);
 		return (NNG_ENOMEM);
 	}
 	if ((rv = ws_parse_url(
 	         url, NULL, &d->host, &d->serv, &d->path, &d->qinfo)) != 0) {
+		nni_ws_dialer_fini(d);
+		return (rv);
+	}
+	if ((rv = nni_aio_init(&d->conaio, ws_conn_cb, d)) != 0) {
 		nni_ws_dialer_fini(d);
 		return (rv);
 	}
@@ -1752,7 +1867,7 @@ nni_ws_dialer_dial(nni_ws_dialer *d, nni_aio *aio)
 		nni_aio_finish_error(aio, NNG_ECLOSED);
 		nni_mtx_unlock(&d->mtx);
 	}
-	nni_list_append(&d->aios, aio);
+	nni_list_append(&d->conaios, aio);
 
 	if (!d->started) {
 		d->started = true;

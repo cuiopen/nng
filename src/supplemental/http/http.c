@@ -364,6 +364,12 @@ http_wr_cb(void *arg)
 		return;
 	}
 
+	if (uaio == NULL) {
+		// write canceled?
+		nni_mtx_unlock(&http->mtx);
+		return;
+	}
+
 	n = nni_aio_count(aio);
 	uaio->a_count += n;
 	if (GET_WR_FLAVOR(uaio) == HTTP_WR_RAW) {
