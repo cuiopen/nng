@@ -28,6 +28,7 @@ struct nni_ws {
 	nni_list_node node;
 	bool          closed;
 	bool          ready;
+	bool          wclose;
 	nni_mtx       mtx;
 	nni_list      txmsgs;
 	nni_list      rxmsgs;
@@ -492,6 +493,18 @@ ws_start_write(nni_ws *ws)
 }
 
 static void
+ws_cancel_close(nni_aio *aio, int rv)
+{
+	nni_ws *ws = aio->a_prov_data;
+	nni_mtx_lock(&ws->mtx);
+	if (ws->wclose) {
+		ws->wclose = false;
+		nni_aio_finish_error(aio, rv);
+	}
+	nni_mtx_unlock(&ws->mtx);
+}
+
+static void
 ws_write_cb(void *arg)
 {
 	nni_ws *  ws = arg;
@@ -510,6 +523,10 @@ ws_write_cb(void *arg)
 			nni_aio_set_msg(wm->aio, NULL);
 			nni_aio_finish_error(wm->aio, NNG_ECLOSED);
 			ws_msg_fini(wm);
+		}
+		if (ws->wclose) {
+			ws->wclose = false;
+			nni_aio_finish(ws->closeaio, 0, 0);
 		}
 		nni_mtx_unlock(&ws->mtx);
 		return;
@@ -590,11 +607,13 @@ ws_send_close(nni_ws *ws, uint16_t code)
 
 	// We don't care about cancellation here.  If this times out,
 	// we will still shut all the physical I/O down in the callback.
-	if (nni_aio_start(aio, NULL, NULL) == 0) {
+	if (nni_aio_start(aio, ws_cancel_close, ws) != 0) {
 		return;
 	}
-	rv = ws_msg_init_control(&wm, ws, WS_CLOSE, buf, sizeof(buf));
+	ws->wclose = true;
+	rv         = ws_msg_init_control(&wm, ws, WS_CLOSE, buf, sizeof(buf));
 	if (rv != 0) {
+		ws->wclose = false;
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
@@ -1136,6 +1155,7 @@ ws_http_cb_dialer(nni_ws *ws, nni_aio *aio)
 #undef GETH
 
 	// At this point, we are in business!
+	ws->ready = true;
 	nni_aio_list_remove(uaio);
 	nni_aio_finish_pipe(uaio, ws);
 	nni_mtx_unlock(&d->mtx);
@@ -1184,6 +1204,9 @@ ws_init(nni_ws **wsp, nni_http *http, nni_http_req *req, nni_http_res *res)
 		nni_ws_fini(ws);
 		return (rv);
 	}
+
+	nni_aio_set_timeout(ws->closeaio, 100);
+	nni_aio_set_timeout(ws->httpaio, 1000);
 
 	ws->fragsize = 1 << 20; // we won't send a frame larger than this
 	ws->maxframe = (1 << 20) * 10; // default limit on incoming frame size
@@ -1866,6 +1889,7 @@ nni_ws_dialer_dial(nni_ws_dialer *d, nni_aio *aio)
 	if (d->closed) {
 		nni_aio_finish_error(aio, NNG_ECLOSED);
 		nni_mtx_unlock(&d->mtx);
+		return;
 	}
 	nni_list_append(&d->conaios, aio);
 
