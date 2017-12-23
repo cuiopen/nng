@@ -17,38 +17,7 @@
 #include "supplemental/base64/base64.h"
 #include "supplemental/http/http.h"
 #include "supplemental/sha1/sha1.h"
-
-// Handshakes are HTTP headers.  They consist of either
-// a request or response line, followed by key-value pairs (one per line),
-// followed by an empty line.  Each line is terminated with a CRLF.
-// Note that a given 'name' may be repeated, in which case its value can
-// simply be appeneded to the prior value, seperated by a colon.
-//
-// GET <path> HTTP/1.1
-// Host: <host>
-// Upgrade: websocket
-// Connection: Upgrade
-// Origin: <somewhere> (not actually used?)
-// Sec-WebSocket-Key: <xxxxx>
-// Sec-WebSocket-Protocol: <x>
-// Sec-WebSocket-Version: 13
-// <empty>
-//
-// From server:
-//
-// HTTP/1.1 101 Switching Protocols
-// Upgrade: websocket
-// Connection: Upgrade
-// Sec-WebSocket-Accept: <xxxx>
-// Sec-WebSocket-Protocol: <x>
-// <empty>
-//
-// Reasonable limits on header size: 8K for everything.
-// Even the most borked implementation should not send more than that.
-// Our maximum address length is 128 bytes.  So frankly even if we max that
-// out we should be under 512 bytes (well); extra fields sent by clients,
-// like client identifiers, should be *small*.  Certainly under 7.5KB.
-//
+#include "supplemental/websocket/websocket.h"
 
 typedef struct ws_ep   ws_ep;
 typedef struct ws_pipe ws_pipe;
@@ -170,29 +139,9 @@ struct ws_pipe {
 	nni_list_node node;
 	ws_ep *       ep;
 	nni_mtx       mtx;
-	nni_http *    http;        // http transport
-	uint8_t       mask[4];     // masking key
-	uint8_t       rxhead[14];  // header buf (rx)
-	uint8_t       rxctrl[125]; // control frame payload
+	nni_http *    http; // http transport
 
-	size_t     rxheadlen;
-	size_t     rxctrllen;
-	size_t     rxpaylen;
-	size_t     rxresid; // remaining rx payload (frame)
-	bool       rxtext;  // frame is TEXT type (must check UTF-8)
-	size_t     rcvmax;  // inherited from EP
-	nni_msg *  rxmsg;
-	ws_rxstate rxstate;
-
-	uint16_t   txclose; // if set, then we should send this close code
-	uint8_t    txhead[14];
-	uint8_t    txctrl[125]; // only for ping/pong really
-	size_t     txheadlen;
-	size_t     txctrllen;
-	size_t     txresid;
-	size_t     txpaylen;
-	nni_msg *  txmsg;
-	ws_txstate txstate;
+	size_t rcvmax; // inherited from EP
 
 	bool     closed;
 	uint16_t rproto;
@@ -203,516 +152,33 @@ struct ws_pipe {
 
 	nni_aio *txaio;
 	nni_aio *rxaio;
-	nni_aio *httpaio;  // server side HTTP reply
-	nni_aio *closeaio; // transmit of close request
 
 	nni_http_req *req;
 	nni_http_res *res;
+
+	nni_ws *ws;
 };
-
-static void ws_pipe_send_start(ws_pipe *);
-
-static void
-ws_pipe_http_cb(void *arg)
-{
-	ws_pipe *p  = arg;
-	ws_ep *  ep = p->ep;
-
-	// This function is only called when completing the HTTP status
-	// transmit.  This is only done on the server side.
-
-	nni_mtx_lock(&ep->mtx);
-	nni_mtx_unlock(&ep->mtx);
-}
-
-static void
-ws_pipe_recv_cb_payload(ws_pipe *p, size_t n)
-{
-	uint8_t *body = nni_msg_body(p->rxmsg);
-	uint8_t *end;
-	nni_aio *aio = p->rxaio;
-
-	NNI_ASSERT(n <= p->rxresid);
-	p->rxresid -= n;
-
-	end = body + nni_msg_len(p->rxmsg);
-
-	if (p->rxresid != 0) {
-		// Still need more data for this frame, continue.
-		aio->a_niov           = 1;
-		aio->a_iov[0].iov_buf = end - p->rxresid;
-		aio->a_iov[0].iov_len = p->rxresid;
-		nni_http_read_full(p->http, aio);
-		return;
-	}
-
-	// Data is unmasked frame-by-frame.  (Each frame can have it's own
-	// masking key.)
-	if (p->rxhead[1] & 0x80) {
-		uint8_t *beg = end - p->rxpaylen;
-		// Unmask the data.  This is done at the frame level.
-		for (int i = 0; beg < end; i++, beg++) {
-			*beg ^= p->mask[i % 4];
-		}
-	}
-
-	if (p->rxhead[0] & 0x80) {
-		// This was final frame.
-		// XXX: check for UTF-8 validity if p->rxtext is true.
-		aio           = p->user_rxaio;
-		p->user_rxaio = NULL;
-		nni_aio_finish_msg(aio, p->rxmsg);
-		p->rxmsg     = NULL;
-		p->rxpaylen  = 0;
-		p->rxheadlen = 0;
-		p->rxctrllen = 0;
-		p->rxresid   = 0;
-		p->rxstate   = WS_RX_HEADER;
-		p->rxtext    = false;
-		return;
-	}
-
-	// We need more data -- (more frames).
-	p->rxstate            = WS_RX_HEADER;
-	p->rxheadlen          = 0;
-	p->rxctrllen          = 0;
-	p->rxresid            = 0;
-	p->rxpaylen           = 0;
-	aio->a_niov           = 1;
-	aio->a_iov[0].iov_len = sizeof(uint16_t);
-	aio->a_iov[0].iov_buf = p->rxhead;
-	nni_http_read_full(p->http, aio);
-}
-
-static void
-ws_apply_mask(nni_aio *aio, uint32_t maskval)
-{
-	uint8_t  mask[sizeof(uint32_t)];
-	int      i, j, k;
-	uint8_t *data;
-
-	NNI_PUT32(mask, maskval);
-	i = 0; // count of bytes masked thus far
-	j = 1; // index to the iov (iov[0] is always head not payload)
-	k = 0; // index within the iov entry
-	for (;;) {
-		if (j == aio->a_niov) {
-			break;
-		}
-		if (k >= aio->a_iov[j].iov_len) {
-			j++;
-			k = 0;
-			continue;
-		}
-		data = aio->a_iov[j].iov_buf;
-		data[k] ^= mask[i % 4];
-		k++;
-		i++;
-	}
-}
-
-static void
-ws_pipe_send_cancel(nni_aio *aio, int rv)
-{
-	ws_pipe *p = aio->a_prov_data;
-
-	nni_mtx_lock(&p->mtx);
-	if (p->user_txaio == aio) {
-		if (p->txstate == WS_TX_DATA) {
-			// Only abort the bottom if its actually in flight.
-			nni_aio_cancel(p->txaio, NNG_ECANCELED);
-		}
-		if (p->txmsg != NULL) {
-			nni_msg_free(p->txmsg);
-			p->txmsg = NULL;
-		}
-		p->user_txaio = NULL;
-		nni_aio_finish_error(aio, rv);
-	}
-	nni_mtx_unlock(&p->mtx);
-}
 
 static void
 ws_pipe_send_cb(void *arg)
 {
-	ws_pipe *p   = arg;
-	nni_aio *aio = p->txaio;
-	int      rv;
+	ws_pipe *p = arg;
+	nni_aio *taio;
+	nni_aio *uaio;
 
 	nni_mtx_lock(&p->mtx);
-	if ((rv = nni_aio_result(aio)) != 0) {
-		if ((aio = p->user_txaio) != NULL) {
-			p->user_txaio = NULL;
-			nni_aio_finish_error(aio, rv);
+	uaio          = p->user_txaio;
+	p->user_txaio = NULL;
+
+	if (uaio != NULL) {
+		int rv;
+		if ((rv = nni_aio_result(taio)) != 0) {
+			nni_aio_finish_error(uaio, rv);
+		} else {
+			nni_aio_finish(uaio, 0, 0);
 		}
-		nni_http_close(p->http);
-		nni_mtx_unlock(&p->mtx);
-		return;
 	}
-	if (p->txstate == WS_TX_CLOSE) {
-		// If we sent the close frame, then shut things down.
-		nni_http_close(p->http);
-		nni_mtx_unlock(&p->mtx);
-		return;
-	}
-	if ((p->txstate == WS_TX_DATA) && (nni_msg_len(p->txmsg) == 0)) {
-		nni_msg_free(p->txmsg);
-		p->txmsg   = NULL;
-		p->txstate = WS_TX_IDLE;
-	}
-	ws_pipe_send_start(p);
 	nni_mtx_unlock(&p->mtx);
-}
-
-static void
-ws_pipe_send_start(ws_pipe *p)
-{
-	// After sending a close frame, we do nothing else.
-	if (p->txstate == WS_TX_CLOSE) {
-		return;
-	}
-
-	if (p->txclose) {
-		// We need to send a close frame - this overrides any
-		// other control frame.
-		NNI_PUT16(p->txctrl, p->txclose);
-		p->txctrllen = sizeof(uint16_t);
-	}
-
-	if (p->txctrllen) {
-		// It turns out that we only send PONGs and CLOSE.
-		// PONG data will already have been loaded in txctrl.
-		p->txhead[0] = p->txclose ? WS_CLOSE : WS_PONG;
-		p->txhead[1] = p->txctrllen;
-
-		p->txstate       = p->txclose ? WS_TX_CLOSE : WS_TX_CONTROL;
-		p->txaio->a_niov = 2;
-		p->txaio->a_iov[1].iov_buf = p->txctrl;
-		p->txaio->a_iov[1].iov_len = p->txctrllen;
-		if (p->mode == NNI_EP_MODE_DIAL) {
-			uint32_t r = nni_random();
-			p->txhead[1] |= 0x80;
-			NNI_PUT32(p->txhead + 2, r);
-			p->txheadlen += sizeof(uint32_t);
-			ws_apply_mask(p->txaio, r);
-		}
-
-		p->txaio->a_iov[0].iov_buf = p->txhead;
-		p->txaio->a_iov[0].iov_len = p->txheadlen;
-
-		// Reset this to zero, so we don't keep doing it.
-		p->txctrllen = 0;
-
-		nni_http_write_full(p->http, p->txaio);
-		return;
-	}
-
-	if (p->txmsg != NULL) {
-		int      niov = 1;
-		uint8_t *data;
-		size_t   size;
-		size_t   n;
-
-		// We send the complete header, always, if present.
-		if (((data = nni_msg_header(p->txmsg)) != NULL) &&
-		    ((size = nni_msg_header_len(p->txmsg)) != 0)) {
-			p->txaio->a_iov[niov].iov_len = size;
-			p->txaio->a_iov[niov].iov_buf = data;
-			niov++;
-			nni_msg_header_clear(p->txmsg);
-		}
-
-		if (size < WS_FRAGMENT_SIZE) {
-			data = nni_msg_body(p->txmsg);
-			n    = nni_msg_len(p->txmsg);
-			if (n > (WS_FRAGMENT_SIZE - size)) {
-				n = WS_FRAGMENT_SIZE - size;
-			}
-
-			p->txaio->a_iov[niov].iov_len = n;
-			p->txaio->a_iov[niov].iov_buf = data;
-			niov++;
-			size += n;
-			nni_msg_trim(p->txmsg, n);
-		}
-
-		// We only ever send WS_BINARY.  No support for TEXT mode.
-		if (p->txstate != WS_TX_IDLE) {
-			p->txhead[0] = WS_CONT;
-		} else {
-			p->txhead[0] = WS_BINARY;
-		}
-
-		if (nni_msg_len(p->txmsg) == 0) {
-			p->txhead[0] |= WS_FINAL;
-		}
-		p->txheadlen = sizeof(uint16_t);
-
-		if (size <= 125) {
-			p->txhead[1] = (uint8_t) size;
-		} else if (size < 65536) {
-			p->txhead[1] = 126;
-			NNI_PUT16(p->txhead + 2, (uint16_t) size);
-			p->txheadlen += sizeof(uint16_t);
-		} else {
-			p->txhead[1] = 127;
-			NNI_PUT64(p->txhead + 2, size);
-			p->txheadlen += sizeof(uint64_t);
-		}
-
-		if (p->mode == NNI_EP_MODE_DIAL) {
-			uint32_t r = nni_random();
-			NNI_PUT32(p->txhead + p->txheadlen, r);
-			p->txheadlen += sizeof(uint32_t);
-			p->txhead[1] |= 0x80; // note masking
-			ws_apply_mask(p->txaio, r);
-		}
-
-		p->txaio->a_iov[0].iov_buf = p->txhead;
-		p->txaio->a_iov[0].iov_len = p->txheadlen;
-		p->txaio->a_niov           = niov;
-		p->txstate                 = WS_TX_DATA;
-		nni_http_write_full(p->http, p->txaio);
-		return;
-	}
-}
-
-static void
-ws_pipe_send_close(ws_pipe *p, int rv)
-{
-	nni_aio *aio;
-	uint16_t code;
-
-	switch (rv) {
-	case NNG_EPROTO:
-		code = WS_CLOSE_PROTOCOL_ERR;
-		break;
-	case NNG_EMSGSIZE:
-		code = WS_CLOSE_TOO_BIG;
-		break;
-	case NNG_ECLOSED:
-		code = WS_CLOSE_NORMAL_CLOSE;
-		break;
-	case NNG_ECANCELED:
-		code = WS_CLOSE_GOING_AWAY;
-		break;
-	case NNG_ENOMEM:
-	default:
-		code = WS_CLOSE_INTERNAL;
-		break;
-	}
-
-	// XXX: REVIEW ME!
-	if ((aio = p->user_rxaio) != NULL) {
-		p->user_rxaio = NULL;
-		nni_aio_finish_error(aio, rv);
-	}
-
-	p->rxstate = WS_RX_CLOSE;
-	p->txclose = code;
-
-	if (p->txstate == WS_TX_IDLE) {
-		ws_pipe_send_start(p);
-	}
-}
-
-static void
-ws_pipe_send_pong(ws_pipe *p, uint8_t *payload, size_t paylen)
-{
-#if 0
-	p->txhead[0] = 0x80 | WS_PONG;
-	memcpy(p->txctrl, payload, paylen);
-	p->txctrllen = paylen;
-#endif
-}
-
-static void
-ws_pipe_recv_cb_control(ws_pipe *p, size_t n)
-{
-	nni_aio *aio = p->rxaio;
-	nni_msg *msg;
-	uint8_t  hdr[2];
-
-	// Read the control data.
-	p->rxresid -= n;
-	if (p->rxresid != 0) {
-		// Still need more data for this frame, continue.
-		aio->a_niov           = 1;
-		aio->a_iov[0].iov_buf = p->rxctrl + p->rxctrllen - p->rxresid;
-		aio->a_iov[0].iov_len = p->rxresid;
-		nni_http_read_full(p->http, aio);
-		return;
-	}
-
-	if (p->rxhead[1] & 0x80) {
-		// unmask it.
-		for (int i = 0; i < p->rxctrllen; i++) {
-			p->rxctrl[i] ^= p->mask[i % 4];
-		}
-	}
-
-	switch (p->rxhead[0] & 0xf) {
-	case WS_PONG:
-		// Discard pong responses, we never send ping.
-		return;
-	case WS_PING:
-		ws_pipe_send_pong(p, p->rxctrl, p->rxctrllen);
-		return;
-	case WS_CLOSE:
-		ws_pipe_send_close(p, NNG_ECLOSED);
-		return;
-	default:
-		ws_pipe_send_close(p, NNG_EPROTO);
-		return;
-	}
-}
-
-static void
-ws_pipe_recv_cb_header(ws_pipe *p, size_t n)
-{
-	nni_aio *aio = p->rxaio;
-	size_t   allocsz;
-	size_t   need;
-	int      rv;
-
-	// we are reading header data.
-	p->rxheadlen += n;
-	need = sizeof(uint16_t);
-
-	if (p->rxheadlen >= sizeof(uint16_t)) {
-		switch (p->rxhead[1] & 0x7f) {
-		case 127:
-			need += 8;
-			break;
-		case 126:
-			need += 2;
-			break;
-		}
-		if (p->rxhead[1] & 0x80) {
-			// mask needed
-			need += 4;
-		}
-	}
-	if (p->rxheadlen < need) {
-		aio->a_niov           = 1;
-		aio->a_iov[0].iov_buf = p->rxhead + p->rxheadlen;
-		aio->a_iov[0].iov_len = need - p->rxheadlen;
-		nni_http_read_full(p->http, aio);
-		return;
-	}
-
-	switch (p->rxhead[1] & 0x7f) {
-	case 127:
-		NNI_GET64(p->rxhead + 2, p->rxpaylen);
-		break;
-	case 126:
-		NNI_GET16(p->rxhead + 2, p->rxpaylen);
-		break;
-	default:
-		p->rxpaylen = p->rxhead[1] & 0x7f;
-		break;
-	}
-
-	if (p->rxhead[1] & 0x80) {
-		// Save the masking key.
-		memcpy(p->mask, p->rxhead - p->rxheadlen, sizeof(uint32_t));
-		// Server MUST NOT send masked frames.
-		if (p->mode == NNI_EP_MODE_DIAL) {
-			ws_pipe_send_close(p, NNG_EPROTO);
-			return;
-		}
-	} else if ((p->mode == NNI_EP_MODE_LISTEN) && (p->rxpaylen > 0)) {
-		// Client MUST send masked frames.  We generously allow
-		// for them to skip sending a mask if there is no data.
-		ws_pipe_send_close(p, NNG_EPROTO);
-		return;
-	}
-
-	if (p->rxhead[0] & 0x70) {
-		// Reserved bits must be zero.
-		ws_pipe_send_close(p, NNG_EPROTO);
-		return;
-	}
-
-	// opcode
-	switch (p->rxhead[0] & 0x0f) {
-	case WS_TEXT:
-	case WS_BINARY:
-		p->rxtext = (p->rxhead[0] == WS_TEXT);
-		if (p->rxmsg != NULL) {
-			ws_pipe_send_close(p, NNG_EPROTO);
-			return;
-		}
-		if (p->rxpaylen > p->rcvmax) {
-			ws_pipe_send_close(p, NNG_EMSGSIZE);
-			return;
-		}
-		p->rxstate = WS_RX_PAYLOAD;
-		allocsz    = p->rxpaylen;
-		if ((p->rxhead[0] & WS_FINAL) == 0) {
-			// Allocate message sizes aggressively for fragmented
-			// frames to minimize reallocation pain.
-			if (allocsz >= WS_FRAGMENT_PREALLOC) {
-				allocsz += WS_FRAGMENT_PREALLOC;
-			} else {
-				allocsz = WS_FRAGMENT_PREALLOC;
-			}
-		}
-		if ((rv = nni_msg_alloc(&p->rxmsg, allocsz)) != 0) {
-			ws_pipe_send_close(p, rv);
-			return;
-		}
-		// This cannot fail, because we allocated not less than this.
-		(void) nni_msg_realloc(p->rxmsg, p->rxpaylen);
-		p->rxresid = p->rxpaylen;
-
-		// No payload, so just do an empty data receive.
-		ws_pipe_recv_cb_payload(p, 0);
-		return;
-
-	case WS_CONT: // continuation frame
-		if (p->rxmsg == NULL) {
-			ws_pipe_send_close(p, NNG_EPROTO);
-			return;
-		}
-		if ((p->rxpaylen + nni_msg_len(p->rxmsg)) > p->rcvmax) {
-			ws_pipe_send_close(p, NNG_EMSGSIZE);
-			return;
-		}
-
-		// It would be nice to be able to check to see if we
-		// were going to have to reallocate the underlying
-		// memory, and grow a larger chunk if we were, but there
-		// is no support for this in the message API.
-		rv = nni_msg_realloc(
-		    p->rxmsg, p->rxpaylen + nni_msg_len(p->rxmsg));
-		if (rv != 0) {
-			ws_pipe_send_close(p, rv);
-			return;
-		}
-		p->rxstate = WS_RX_PAYLOAD;
-		p->rxresid = p->rxpaylen;
-		ws_pipe_recv_cb_payload(p, 0);
-		return;
-
-	case WS_CLOSE:
-	case WS_PING:
-	case WS_PONG:
-		// The other side is closing the connection.
-		// NNG_ECLOSED.
-		p->rxstate = WS_RX_CONTROL;
-		p->rxresid = p->rxpaylen;
-		if (p->rxresid > 125) {
-			rv = NNG_EPROTO;
-			break;
-		}
-		ws_pipe_recv_cb_control(p, 0);
-		return;
-
-	default:
-		ws_pipe_send_close(p, NNG_EPROTO);
-		return;
-	}
 }
 
 static void
@@ -721,44 +187,23 @@ ws_pipe_recv_cb(void *arg)
 	ws_pipe *p = arg;
 	nni_aio *uaio;
 	nni_aio *raio;
-	size_t   n;
-	size_t   need;
-	uint8_t  opcode;
-	size_t   paylen;
-	bool     masked;
-	bool     final;
 	int      rv;
 
 	nni_mtx_lock(&p->mtx);
-	if ((uaio = p->user_rxaio) == NULL) {
-		// Canceled.
-		ws_pipe_send_close(p, NNG_ECANCELED);
-		nni_mtx_unlock(&p->mtx);
-		return;
-	}
-	raio = p->rxaio;
+	uaio          = p->user_rxaio;
+	p->user_rxaio = NULL;
 	if ((rv = nni_aio_result(raio)) != 0) {
-		ws_pipe_send_close(p, rv);
-		nni_mtx_unlock(&p->mtx);
-		return;
+		if (uaio != NULL) {
+			nni_aio_finish_error(uaio, rv);
+		}
+	} else {
+		nni_msg *msg = nni_aio_get_msg(raio);
+		if (uaio != NULL) {
+			nni_aio_finish_msg(uaio, msg);
+		} else {
+			nni_msg_free(msg);
+		}
 	}
-
-	n = nni_aio_count(raio);
-
-	switch (p->rxstate) {
-	case WS_RX_PAYLOAD:
-		ws_pipe_recv_cb_payload(p, n);
-		break;
-	case WS_RX_CONTROL:
-		ws_pipe_recv_cb_control(p, n);
-		break;
-	case WS_RX_HEADER:
-		ws_pipe_recv_cb_header(p, n);
-		break;
-	case WS_RX_CLOSE:
-		break;
-	}
-
 	nni_mtx_unlock(&p->mtx);
 }
 
@@ -771,11 +216,8 @@ ws_pipe_recv_cancel(nni_aio *aio, int rv)
 		nni_mtx_unlock(&p->mtx);
 		return;
 	}
-	p->user_rxaio = NULL;
-	nni_mtx_unlock(&p->mtx);
-
 	nni_aio_cancel(p->rxaio, rv);
-	nni_aio_finish_error(aio, rv);
+	nni_mtx_unlock(&p->mtx);
 }
 
 static void
@@ -783,32 +225,29 @@ ws_pipe_recv(void *arg, nni_aio *aio)
 {
 	ws_pipe *p = arg;
 
-	// For receive, we want to read the mandatory header (16 bits),
-	// and then we will schedule a follow up read of the residual
-	// part.  However, we want to consume from the residual part
-	// that might be left over from the HTTP header read.
-	// Outstanding question here: do we just start a forever read,
-	// loading the HTTP data, and consuming from it (following the
-	// TLS model) or do we issue partial reads.  I suspect that
-	// buffering here is preferable, but need to be aware of double
-	// buffering done by underlying TLS.
-
 	nni_mtx_lock(&p->mtx);
 	if (nni_aio_start(aio, ws_pipe_recv_cancel, p) != 0) {
 		nni_mtx_unlock(&p->mtx);
 		return;
 	}
-
 	p->user_rxaio = aio;
-	NNI_ASSERT(p->rxmsg == NULL);
 
-	aio                   = p->rxaio;
-	aio->a_iov[0].iov_buf = p->rxhead;
-	aio->a_iov[0].iov_len = sizeof(uint16_t);
-	p->rxheadlen          = 0;
-	p->rxstate            = WS_RX_HEADER;
+	nni_ws_recv_msg(p->ws, p->rxaio);
+	nni_mtx_unlock(&p->mtx);
+}
 
-	nni_http_read_full(p->http, aio);
+static void
+ws_pipe_send_cancel(nni_aio *aio, int rv)
+{
+	ws_pipe *p = aio->a_prov_data;
+	nni_mtx_lock(&p->mtx);
+	if (p->user_txaio != aio) {
+		nni_mtx_unlock(&p->mtx);
+		return;
+	}
+	// This aborts the upper send, which will call back with an error
+	// when it is done.
+	nni_aio_cancel(p->txaio, rv);
 	nni_mtx_unlock(&p->mtx);
 }
 
@@ -821,16 +260,11 @@ ws_pipe_send(void *arg, nni_aio *aio)
 	if (nni_aio_start(aio, ws_pipe_send_cancel, p) != 0) {
 		nni_mtx_unlock(&p->mtx);
 	}
-	if (p->txstate == WS_TX_CLOSE) {
-		nni_aio_finish_error(aio, NNG_ECLOSED);
-		nni_mtx_unlock(&p->mtx);
-	}
 	p->user_txaio = aio;
-	p->txmsg      = nni_aio_get_msg(aio);
+	nni_aio_set_msg(p->txaio, nni_aio_get_msg(aio));
 	nni_aio_set_msg(aio, NULL);
-	if (p->txstate == WS_TX_IDLE) {
-		ws_pipe_send_start(p);
-	}
+
+	nni_ws_send_msg(p->ws, p->txaio);
 	nni_mtx_unlock(&p->mtx);
 }
 
@@ -839,18 +273,8 @@ ws_pipe_fini(void *arg)
 {
 	ws_pipe *p = arg;
 
-	// Wait slightly for timeout if we were trying to send a message.
-	if (p->httpaio != NULL) {
-		nni_aio_wait(p->httpaio);
-	}
-	if (p->closeaio != NULL) {
-		nni_aio_wait(p->closeaio);
-	}
-
 	nni_aio_stop(p->rxaio);
 	nni_aio_stop(p->txaio);
-	nni_aio_stop(p->httpaio);
-	nni_aio_stop(p->closeaio);
 
 	if (p->http) {
 		nni_http_fini(p->http);
@@ -858,14 +282,15 @@ ws_pipe_fini(void *arg)
 
 	nni_aio_fini(p->rxaio);
 	nni_aio_fini(p->txaio);
-	nni_aio_fini(p->httpaio);
-	nni_aio_fini(p->closeaio);
 
 	if (p->req) {
 		nni_http_req_fini(p->req);
 	}
 	if (p->res) {
 		nni_http_res_fini(p->res);
+	}
+	if (p->ws) {
+		nni_ws_fini(p->ws);
 	}
 	nni_mtx_fini(&p->mtx);
 	NNI_FREE_STRUCT(p);
@@ -904,49 +329,17 @@ ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *http)
 	// finish handler -- it has a strict timeout to ensure that we
 	// get the message out if at all possible.
 	if (((rv = nni_aio_init(&p->txaio, ws_pipe_send_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->rxaio, ws_pipe_recv_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->httpaio, ws_pipe_http_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->closeaio, NULL, NULL)) != 0)) {
+	    ((rv = nni_aio_init(&p->rxaio, ws_pipe_recv_cb, p)) != 0)) {
 		ws_pipe_fini(p);
 		return (rv);
 	}
 
-	// We set a timeout on the HTTP reply, because if the other side
-	// takes too long to receive it (backpressure?  Not sure how this
-	// happens with normal TCP segment sizes) then we want to kill the
-	// connection.
-	nni_aio_set_timeout(p->httpaio, 1000);
-
-	// If we take longer than 100 milliseconds to send a close, then just
-	// kill the connection.  No point in hanging around longer than that.
-	// Note that many implementations don't even bother trying to send a
-	// close frame at all!
-	nni_aio_set_timeout(p->closeaio, 100);
-
 	p->mode   = ep->mode;
 	p->rcvmax = ep->rcvmax;
 	//	p->addr   = ep->addr;
-	p->http    = http;
-	p->rxstate = WS_RX_HEADER;
-	p->txstate = WS_TX_IDLE;
-	p->rproto  = ep->rproto;
-	p->lproto  = ep->lproto;
-
-	if (p->mode == NNI_EP_MODE_LISTEN) {
-		if (((rv = nni_http_res_init(&p->res)) != 0) ||
-		    ((rv = nni_http_res_set_version(p->res, "HTTP/1.1")) !=
-		        0)) {
-			ws_pipe_fini(p);
-			return (rv);
-		}
-	} else {
-		if (((rv = nni_http_req_init(&p->req)) != 0) ||
-		    ((rv = nni_http_req_set_version(p->req, "HTTP/1.1")) !=
-		        0)) {
-			ws_pipe_fini(p);
-			return (rv);
-		}
-	}
+	p->http   = http;
+	p->rproto = ep->rproto;
+	p->lproto = ep->lproto;
 
 	nni_mtx_lock(&ep->mtx);
 	p->ep = ep;
@@ -1121,121 +514,6 @@ ws_ep_fini(void *arg)
 	NNI_FREE_STRUCT(ep);
 }
 
-// input is base64 challenge, output is the accepted.  input should be
-// 23 character base 64, output is 28 character base64 reply.  (output
-// must be large enough to hold 29 bytes to allow for termination.)
-// Returns 0 on success, NNG_EINVAL if the input is malformed somehow.
-static int
-ws_make_accept(const char *key, char *accept)
-{
-	uint8_t      rawkey[16];
-	uint8_t      digest[20];
-	char         resp[29];
-	nni_sha1_ctx ctx;
-
-	if ((strlen(key) != 23) ||
-	    (nni_base64_decode(key, 23, rawkey, 16) != 16)) {
-		return (NNG_EINVAL);
-	}
-
-	nni_sha1_init(&ctx);
-	nni_sha1_update(&ctx, rawkey, 16);
-	nni_sha1_update(&ctx, (uint8_t *) WS_KEY_GUID, WS_KEY_GUIDLEN);
-	nni_sha1_final(&ctx, digest);
-
-	nni_base64_encode(digest, 20, accept, 28);
-	accept[28] = '\0';
-	return (0);
-}
-
-// ws_ep_handle handles requests coming from the server.
-static void
-ws_ep_handle(nni_aio *aio)
-{
-	nni_http *    http = nni_aio_get_input(aio, 0);
-	nni_http_req *req  = nni_aio_get_input(aio, 1);
-	nni_http_res *res;
-	ws_ep *       ep = nni_aio_get_input(aio, 2);
-	ws_pipe *     p;
-	int           rv;
-	char          keyaccept[29];
-	const char *  ptr;
-
-	nni_aio_set_input(aio, 0, NULL);
-	nni_aio_set_input(aio, 1, NULL);
-	nni_aio_set_input(aio, 2, NULL);
-	nni_aio_set_output(aio, 0, NULL);
-	nni_aio_finish(aio, 0, 0);
-
-	if ((rv = ws_pipe_init(&p, ep, http)) != 0) {
-		nni_http_req_fini(req);
-		nni_http_fini(http);
-		return;
-	}
-	p->req = req;
-
-	if ((rv = nni_http_res_init(&p->res)) != 0) {
-		ws_pipe_fini(p);
-		return;
-	}
-
-// Upgrade: websocket
-// Connection: Upgrade
-// Origin: <somewhere> (not actually used?)
-// Sec-WebSocket-Key: <xxxxx>
-// Sec-WebSocket-Protocol: <x>
-// Sec-WebSocket-Version: 13
-#define GETH(h) nni_http_req_get_header(p->req, h)
-#define SETH(h, v) nni_http_res_set_header(p->res, h, v)
-
-	// We require HTTP/1.1, valid websocket headers, and an empty
-	// GET body. We also require the WebSocket-Protocol to be
-	// present (and one we recognize).  (In theory we should *IGNORE*
-	// the GET body, but this is easier.)
-	if ((strcmp(nni_http_req_get_version(p->req), "HTTP/1.1") != 0) ||
-	    (((ptr = GETH("Content-Length")) != NULL) && (atoi(ptr) > 0)) ||
-	    (((ptr = GETH("Transfer-Encoding")) != NULL) &&
-	        (nni_strcasestr(ptr, "chunked") != NULL)) ||
-	    ((ptr = GETH("Upgrade")) == NULL) ||
-	    (strcasecmp(ptr, "websocket") != 0) ||
-	    ((ptr = GETH("Connection")) == NULL) ||
-	    (nni_strcasestr(ptr, "upgrade") == NULL) ||
-	    ((ptr = GETH("Sec-WebSocket-Version")) == NULL) ||
-	    (strcmp(ptr, "13") != 0) ||
-	    ((ptr = GETH("Sec-WebSocket-Key")) == NULL) ||
-	    (ws_make_accept(ptr, keyaccept) != 0) ||
-	    ((ptr = GETH("Sec-WebSocket-Protocol")) == NULL) ||
-	    (strcmp(ptr, ep->protoname) != 0)) {
-
-		if (((rv = SETH("Connection", "close")) != 0) ||
-		    ((rv = nni_http_res_set_status(p->res,
-		          NNI_HTTP_STATUS_BAD_REQUEST, "Bad request")) != 0)) {
-			ws_pipe_fini(p);
-			return;
-		}
-		nni_http_write_res(p->http, p->res, p->httpaio);
-		ws_pipe_fini(p);
-		return;
-	}
-
-	// HTTP/1.1 101 Switching Protocols
-	// Upgrade: websocket
-	// Connection: Upgrade
-	// Sec-WebSocket-Accept: <xxxx>
-	// Sec-WebSocket-Protocol: <x>
-
-	if (((rv = SETH("Sec-WebSocket-Accept", keyaccept)) != 0) ||
-	    ((rv = SETH("Sec-WebSocket-Protocol", ep->protoname)) != 0) ||
-	    ((rv = SETH("Connection", "upgrade")) != 0) ||
-	    ((rv = SETH("Upgrade", "websocket")) != 0) ||
-	    ((rv = nni_http_res_set_status(
-	          p->res, 101, "Switching protocols")) != 0)) {
-		ws_pipe_fini(p);
-		return;
-	}
-	nni_http_write_res(p->http, p->res, p->httpaio);
-}
-
 static void
 ws_ep_conn_cb(void *arg)
 {
@@ -1389,12 +667,6 @@ ws_ep_init(void **epp, const char *url, nni_sock *sock, int mode)
 		// them. (This is only for registration.  The client
 		// can still supply them, and we will match and pass to
 		// the handler.)
-		ep->handler.h_path        = ep->path;
-		ep->handler.h_method      = "GET";
-		ep->handler.h_host        = ep->host;
-		ep->handler.h_is_upgrader = true;
-		ep->handler.h_is_dir      = false;
-		ep->handler.h_cb          = ws_ep_handle;
 		rv = nni_http_server_init(&ep->server, &sa);
 	}
 

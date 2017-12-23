@@ -1279,6 +1279,15 @@ ws_parse_url(const char *url, char **schemep, char **hostp, char **servp,
 		return (rv);
 	}
 
+	// If service was missing, assume normal defaults.
+	if (*servp == NULL) {
+		if (strcmp(scheme, "wss")) {
+			*servp = nni_strdup("443");
+		} else {
+			*servp = nni_strdup("80");
+		}
+	}
+
 	if (path) {
 		// Restore the path, and trim off the query parameter.
 		*path = '/';
@@ -1298,14 +1307,11 @@ ws_parse_url(const char *url, char **schemep, char **hostp, char **servp,
 		*queryp = nni_strdup(query);
 	}
 
-	if ((schemep && (*schemep == NULL)) || (pathp && (*pathp == NULL)) ||
+	if ((schemep && (*schemep == NULL)) || (*pathp == NULL) ||
+	    (*servp == NULL) || (*hostp == NULL) ||
 	    (queryp && (*queryp == NULL))) {
-		if (hostp) {
-			nni_strfree(*hostp);
-		}
-		if (servp) {
-			nni_strfree(*servp);
-		}
+		nni_strfree(*hostp);
+		nni_strfree(*servp);
 		if (schemep) {
 			nni_strfree(*schemep);
 		}
