@@ -68,10 +68,10 @@ nni_fini(void)
 	nni_ep_sys_fini();
 	nni_sock_sys_fini();
 	nni_random_sys_fini();
+	nni_reap_sys_fini(); // must be before timer and aio (expire)
 	nni_aio_sys_fini();
 	nni_timer_sys_fini();
 	nni_taskq_sys_fini();
-	nni_reap_sys_fini();
 
 	nni_mtx_fini(&nni_init_mtx);
 	nni_plat_fini();
