@@ -62,6 +62,8 @@ set (NNG_SOURCES
     core/protocol.h
     core/random.c
     core/random.h
+    core/reap.c
+    core/reap.h
     core/socket.c
     core/socket.h
     core/strs.c
