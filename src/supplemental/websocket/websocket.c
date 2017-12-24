@@ -26,6 +26,7 @@ typedef struct ws_msg   ws_msg;
 struct nni_ws {
 	int           mode; // NNI_EP_MODE_DIAL or NNI_EP_MODE_LISTEN
 	nni_list_node node;
+	nni_reap_item reap;
 	bool          closed;
 	bool          ready;
 	bool          wclose;
@@ -205,6 +206,7 @@ ws_msg_fini(ws_msg *wm)
 {
 	ws_frame *frame;
 
+	NNI_ASSERT(!nni_list_node_active(&wm->node));
 	while ((frame = nni_list_first(&wm->frames)) != NULL) {
 		nni_list_remove(&wm->frames, frame);
 		ws_frame_fini(frame);
@@ -224,6 +226,7 @@ ws_mask_frame(ws_frame *frame)
 	if (frame->masked) {
 		return;
 	}
+	r = nni_random();
 	NNI_PUT32(frame->mask, r);
 	for (int i = 0; i < frame->len; i++) {
 		frame->buf[i] ^= frame->mask[i % 4];
@@ -263,17 +266,19 @@ ws_msg_init_control(
 	if ((wm = NNI_ALLOC_STRUCT(wm)) == NULL) {
 		return (NNG_ENOMEM);
 	}
-	NNI_LIST_INIT(&wm->frames, ws_frame, node);
-	memcpy(frame->sdata, buf, len);
 
 	if ((frame = NNI_ALLOC_STRUCT(frame)) == NULL) {
 		ws_msg_fini(wm);
 		return (NNG_ENOMEM);
 	}
 
+	NNI_LIST_INIT(&wm->frames, ws_frame, node);
+	memcpy(frame->sdata, buf, len);
+
 	nni_list_append(&wm->frames, frame);
 	frame->wmsg    = wm;
 	frame->len     = len;
+	frame->final   = true;
 	frame->op      = op;
 	frame->head[0] = op | 0x80; // final frame (control)
 	frame->head[1] = len & 0x7F;
@@ -289,6 +294,7 @@ ws_msg_init_control(
 
 	wm->aio = NULL;
 	wm->ws  = ws;
+	*wmp    = wm;
 	return (0);
 }
 
@@ -454,14 +460,6 @@ ws_close(nni_ws *ws, uint16_t code)
 		ws_send_close(ws, code);
 		return;
 	}
-
-	while ((wm = nni_list_first(&ws->txmsgs)) != NULL) {
-		nni_list_remove(&ws->txmsgs, wm);
-		if (wm->aio) {
-			nni_aio_finish_error(wm->aio, NNG_ECLOSED);
-		}
-		ws_msg_fini(wm);
-	}
 }
 
 static void
@@ -487,8 +485,10 @@ ws_start_write(nni_ws *ws)
 	ws->txaio->a_niov           = frame->len > 0 ? 2 : 1;
 	ws->txaio->a_iov[0].iov_len = frame->hlen;
 	ws->txaio->a_iov[0].iov_buf = frame->head;
-	ws->txaio->a_iov[1].iov_len = frame->len;
-	ws->txaio->a_iov[1].iov_buf = frame->buf;
+	if (frame->len > 0) {
+		ws->txaio->a_iov[1].iov_len = frame->len;
+		ws->txaio->a_iov[1].iov_buf = frame->buf;
+	}
 	nni_http_write_full(ws->http, ws->txaio);
 }
 
@@ -520,8 +520,10 @@ ws_write_cb(void *arg)
 		// No other messages may succeed..
 		while ((wm = nni_list_first(&ws->txmsgs)) != NULL) {
 			nni_list_remove(&ws->txmsgs, wm);
-			nni_aio_set_msg(wm->aio, NULL);
-			nni_aio_finish_error(wm->aio, NNG_ECLOSED);
+			if (wm->aio != NULL) {
+				nni_aio_set_msg(wm->aio, NULL);
+				nni_aio_finish_error(wm->aio, NNG_ECLOSED);
+			}
 			ws_msg_fini(wm);
 		}
 		if (ws->wclose) {
@@ -575,16 +577,18 @@ ws_write_cancel(nni_aio *aio, int rv)
 
 	// Is this aio active?  We can tell by looking at the
 	// active tx frame.
-
 	wm = aio->a_prov_data;
 	ws = wm->ws;
+	nni_mtx_lock(&ws->mtx);
 	if (((frame = ws->txframe) != NULL) && (frame->wmsg == wm)) {
 		nni_aio_cancel(ws->txaio, rv);
 		// We will wait for callback on the txaio to finish aio.
 	} else if (nni_list_active(&ws->txmsgs, wm)) {
 		// If scheduled, just need to remove node and complete it.
 		nni_list_remove(&ws->txmsgs, wm);
+		wm->aio = NULL;
 		nni_aio_finish_error(aio, rv);
+		ws_msg_fini(wm);
 	}
 	nni_mtx_unlock(&ws->mtx);
 }
@@ -670,7 +674,7 @@ nni_ws_send_msg(nni_ws *ws, nni_aio *aio)
 		nni_mtx_unlock(&ws->mtx);
 		return;
 	}
-	if (nni_aio_start(aio, ws_write_cancel, wm) == 0) {
+	if (nni_aio_start(aio, ws_write_cancel, wm) != 0) {
 		nni_mtx_unlock(&ws->mtx);
 		ws_msg_fini(wm);
 		return;
@@ -714,7 +718,7 @@ ws_start_read(nni_ws *ws)
 	aio                   = ws->rxaio;
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = 2; // We want the first two bytes.
-	aio->a_iov[0].iov_buf = frame->buf;
+	aio->a_iov[0].iov_buf = frame->head;
 	nni_http_read_full(ws->http, aio);
 }
 
@@ -804,6 +808,7 @@ ws_read_frame_cb(nni_ws *ws, ws_frame *frame)
 			body += frame->len;
 		}
 		nni_aio_finish_msg(wm->aio, msg);
+		wm->aio = NULL;
 		ws_msg_fini(wm);
 	}
 }
@@ -971,8 +976,10 @@ nni_ws_recv_msg(nni_ws *ws, nni_aio *aio)
 		nni_mtx_unlock(&ws->mtx);
 		return;
 	}
-	nni_list_append(&ws->rxmsgs, wm);
-	ws_start_read(ws);
+	if (nni_aio_start(aio, ws_read_cancel, wm) == 0) {
+		nni_list_append(&ws->rxmsgs, wm);
+		ws_start_read(ws);
+	}
 	nni_mtx_unlock(&ws->mtx);
 }
 
@@ -1002,9 +1009,10 @@ nni_ws_request(nni_ws *ws)
 	return (ws->req);
 }
 
-void
-nni_ws_fini(nni_ws *ws)
+static void
+ws_fini(void *arg)
 {
+	nni_ws *ws = arg;
 	ws_msg *wm;
 
 	nni_ws_close(ws);
@@ -1050,6 +1058,12 @@ nni_ws_fini(nni_ws *ws)
 	NNI_FREE_STRUCT(ws);
 }
 
+void
+nni_ws_fini(nni_ws *ws)
+{
+	nni_reap(&ws->reap, ws_fini, ws);
+}
+
 static void
 ws_http_cb_listener(nni_ws *ws, nni_aio *aio)
 {
@@ -1066,6 +1080,7 @@ ws_http_cb_listener(nni_ws *ws, nni_aio *aio)
 	}
 	ws->ready = true;
 	if ((aio = nni_list_first(&l->aios)) != NULL) {
+		nni_list_remove(&l->aios, aio);
 		nni_aio_finish_pipe(aio, ws);
 	} else {
 		nni_list_append(&l->pend, ws);
@@ -1136,9 +1151,9 @@ ws_http_cb_dialer(nni_ws *ws, nni_aio *aio)
 
 	if (((ptr = GETH("Sec-WebSocket-Accept")) == NULL) ||
 	    (strcmp(ptr, wskey) != 0) ||
-	    ((ptr = GETH("Connection")) != NULL) ||
+	    ((ptr = GETH("Connection")) == NULL) ||
 	    (!ws_contains_word(ptr, "upgrade")) ||
-	    ((ptr = GETH("Upgrade")) != NULL) ||
+	    ((ptr = GETH("Upgrade")) == NULL) ||
 	    (strcmp(ptr, "websocket") != 0)) {
 		nni_ws_close_error(ws, WS_CLOSE_PROTOCOL_ERR);
 		rv = NNG_EPROTO;
@@ -1456,8 +1471,7 @@ ws_parse_url(const char *url, char **schemep, char **hostp, char **servp,
 	}
 
 	if ((schemep && (*schemep == NULL)) || (*pathp == NULL) ||
-	    (*servp == NULL) || (*hostp == NULL) ||
-	    (queryp && (*queryp == NULL))) {
+	    (*servp == NULL) || (queryp && (*queryp == NULL))) {
 		nni_strfree(*hostp);
 		nni_strfree(*servp);
 		if (schemep) {
@@ -1645,6 +1659,8 @@ nni_ws_listener_listen(nni_ws_listener *l)
 		nni_http_server_fini(l->server);
 		l->server = NULL;
 	}
+
+	l->started = true;
 
 	nni_mtx_unlock(&l->mtx);
 	return (0);

@@ -56,6 +56,7 @@ ws_pipe_send_cb(void *arg)
 	nni_aio *uaio;
 
 	nni_mtx_lock(&p->mtx);
+	taio          = p->txaio;
 	uaio          = p->user_txaio;
 	p->user_txaio = NULL;
 
@@ -73,9 +74,9 @@ ws_pipe_send_cb(void *arg)
 static void
 ws_pipe_recv_cb(void *arg)
 {
-	ws_pipe *p = arg;
+	ws_pipe *p    = arg;
+	nni_aio *raio = p->rxaio;
 	nni_aio *uaio;
-	nni_aio *raio;
 	int      rv;
 
 	nni_mtx_lock(&p->mtx);
@@ -148,6 +149,7 @@ ws_pipe_send(void *arg, nni_aio *aio)
 	nni_mtx_lock(&p->mtx);
 	if (nni_aio_start(aio, ws_pipe_send_cancel, p) != 0) {
 		nni_mtx_unlock(&p->mtx);
+		return;
 	}
 	p->user_txaio = aio;
 	nni_aio_set_msg(p->txaio, nni_aio_get_msg(aio));
@@ -211,12 +213,10 @@ ws_pipe_init(ws_pipe **pipep, ws_ep *ep, void *ws)
 	p->lproto = ep->lproto;
 	p->ws     = ws;
 
-	nni_mtx_lock(&ep->mtx);
 	if ((aio = nni_list_first(&ep->aios)) != NULL) {
 		nni_aio_list_remove(aio);
 		nni_aio_finish_pipe(aio, p);
 	}
-	nni_mtx_unlock(&ep->mtx);
 
 	*pipep = p;
 	return (0);
