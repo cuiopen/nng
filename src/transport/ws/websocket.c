@@ -367,6 +367,7 @@ ws_ep_fini(void *arg)
 		nni_ws_dialer_fini(ep->dialer);
 	}
 	nni_strfree(ep->addr);
+	nni_strfree(ep->protoname);
 	nni_mtx_fini(&ep->mtx);
 	NNI_FREE_STRUCT(ep);
 }

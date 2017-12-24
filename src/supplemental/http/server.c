@@ -85,14 +85,12 @@ http_sconn_fini(void *arg)
 	nni_aio_stop(sc->cbaio);
 	if (sc->http != NULL) {
 		nni_http_fini(sc->http);
-		sc->http = NULL;
 	}
 	if (sc->req != NULL) {
 		nni_http_req_fini(sc->req);
 	}
 	if (sc->res != NULL) {
 		nni_http_res_fini(sc->res);
-		sc->res = NULL;
 	}
 	nni_aio_fini(sc->rxaio);
 	nni_aio_fini(sc->txaio);
@@ -455,7 +453,9 @@ http_sconn_cbdone(void *arg)
 	// means that they took over, and we should just discard this session,
 	// without closing the underlying channel.
 	if ((h->h_is_upgrader) && (res == NULL)) {
-		sc->http = NULL;      // the underlying HTTP is not closed
+		sc->http = NULL; // the underlying HTTP is not closed
+		sc->req  = NULL;
+		sc->res  = NULL;
 		http_sconn_close(sc); // discard server session though
 		return;
 	}

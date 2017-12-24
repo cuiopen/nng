@@ -1049,6 +1049,13 @@ ws_fini(void *arg)
 	}
 	nni_mtx_unlock(&ws->mtx);
 
+	if (ws->req) {
+		nni_http_req_fini(ws->req);
+	}
+	if (ws->res) {
+		nni_http_res_fini(ws->res);
+	}
+
 	nni_http_fini(ws->http);
 	nni_aio_fini(ws->rxaio);
 	nni_aio_fini(ws->txaio);
@@ -1469,6 +1476,7 @@ ws_parse_url(const char *url, char **schemep, char **hostp, char **servp,
 	if (queryp) {
 		*queryp = nni_strdup(query);
 	}
+	nni_free(scr, scrlen);
 
 	if ((schemep && (*schemep == NULL)) || (*pathp == NULL) ||
 	    (*servp == NULL) || (queryp && (*queryp == NULL))) {
@@ -1483,7 +1491,6 @@ ws_parse_url(const char *url, char **schemep, char **hostp, char **servp,
 		if (queryp) {
 			nni_strfree(*queryp);
 		}
-		nni_free(scr, scrlen);
 		return (NNG_ENOMEM);
 	}
 
@@ -1774,12 +1781,16 @@ err:
 	if (http != NULL) {
 		nni_http_fini(http);
 	}
+	if (req != NULL) {
+		nni_http_req_fini(req);
+	}
 	nni_mtx_unlock(&d->mtx);
 }
 
 void
 nni_ws_dialer_fini(nni_ws_dialer *d)
 {
+	nni_aio_fini(d->conaio);
 	nni_strfree(d->proto);
 	nni_strfree(d->addr);
 	nni_strfree(d->uri);
