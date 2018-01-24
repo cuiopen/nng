@@ -13,26 +13,15 @@
 
 #include <stdbool.h>
 
-typedef struct nni_http_res    nni_http_res;
-typedef struct nni_http_entity nni_http_entity;
+typedef struct nni_http_res nni_http_res;
 
-typedef struct nni_http_req nni_http_req;
+typedef struct nng_http_req nni_http_req;
 
-extern int  nni_http_req_init(nni_http_req **);
-extern void nni_http_req_fini(nni_http_req *);
-extern void nni_http_req_reset(nni_http_req *);
-extern int nni_http_req_set_header(nni_http_req *, const char *, const char *);
-extern int nni_http_req_add_header(nni_http_req *, const char *, const char *);
-extern int nni_http_req_del_header(nni_http_req *, const char *);
-extern int nni_http_req_get_buf(nni_http_req *, void **, size_t *);
-extern int nni_http_req_set_method(nni_http_req *, const char *);
-extern int nni_http_req_set_version(nni_http_req *, const char *);
-extern int nni_http_req_set_uri(nni_http_req *, const char *);
-extern const char *nni_http_req_get_header(nni_http_req *, const char *);
-extern const char *nni_http_req_get_header(nni_http_req *, const char *);
-extern const char *nni_http_req_get_version(nni_http_req *);
-extern const char *nni_http_req_get_uri(nni_http_req *);
-extern const char *nni_http_req_get_method(nni_http_req *);
+// These functions are private to the internal framework, and really should
+// not be used elsewhere.
+extern int   nni_http_req_init(nni_http_req **);
+extern void  nni_http_req_reset(nni_http_req *);
+extern int   nni_http_req_get_buf(nni_http_req *, void **, size_t *);
 extern int   nni_http_req_parse(nni_http_req *, void *, size_t, size_t *);
 extern char *nni_http_req_headers(nni_http_req *);
 
@@ -56,68 +45,6 @@ extern int   nni_http_res_alloc_data(nni_http_res *, size_t);
 extern void  nni_http_res_get_data(nni_http_res *, void **, size_t *);
 extern int   nni_http_res_init_error(nni_http_res **, uint16_t);
 extern char *nni_http_res_headers(nni_http_res *);
-
-// HTTP status codes.  This list is not exhaustive.
-enum { NNI_HTTP_STATUS_CONTINUE                  = 100,
-	NNI_HTTP_STATUS_SWITCHING                = 101,
-	NNI_HTTP_STATUS_PROCESSING               = 102,
-	NNI_HTTP_STATUS_OK                       = 200,
-	NNI_HTTP_STATUS_CREATED                  = 201,
-	NNI_HTTP_STATUS_ACCEPTED                 = 202,
-	NNI_HTTP_STATUS_NOT_AUTHORITATIVE        = 203,
-	NNI_HTTP_STATUS_NO_CONTENT               = 204,
-	NNI_HTTP_STATUS_RESET_CONTENT            = 205,
-	NNI_HTTP_STATUS_PARTIAL_CONTENT          = 206,
-	NNI_HTTP_STATUS_MULTI_STATUS             = 207,
-	NNI_HTTP_STATUS_ALREADY_REPORTED         = 208,
-	NNI_HTTP_STATUS_IM_USED                  = 226,
-	NNI_HTTP_STATUS_MULTIPLE_CHOICES         = 300,
-	NNI_HTTP_STATUS_STATUS_MOVED_PERMANENTLY = 301,
-	NNI_HTTP_STATUS_FOUND                    = 302,
-	NNI_HTTP_STATUS_SEE_OTHER                = 303,
-	NNI_HTTP_STATUS_NOT_MODIFIED             = 304,
-	NNI_HTTP_STATUS_USE_PROXY                = 305,
-	NNI_HTTP_STATUS_TEMPORARY_REDIRECT       = 307,
-	NNI_HTTP_STATUS_PERMANENT_REDIRECT       = 308,
-	NNI_HTTP_STATUS_BAD_REQUEST              = 400,
-	NNI_HTTP_STATUS_UNAUTHORIZED             = 401,
-	NNI_HTTP_STATUS_PAYMENT_REQUIRED         = 402,
-	NNI_HTTP_STATUS_FORBIDDEN                = 403,
-	NNI_HTTP_STATUS_NOT_FOUND                = 404,
-	NNI_HTTP_STATUS_METHOD_NOT_ALLOWED       = 405,
-	NNI_HTTP_STATUS_NOT_ACCEPTABLE           = 406,
-	NNI_HTTP_STATUS_PROXY_AUTH_REQUIRED      = 407,
-	NNI_HTTP_STATUS_REQUEST_TIMEOUT          = 408,
-	NNI_HTTP_STATUS_CONFLICT                 = 409,
-	NNI_HTTP_STATUS_GONE                     = 410,
-	NNI_HTTP_STATUS_LENGTH_REQUIRED          = 411,
-	NNI_HTTP_STATUS_PRECONDITION_FAILED      = 412,
-	NNI_HTTP_STATUS_PAYLOAD_TOO_LARGE        = 413,
-	NNI_HTTP_STATUS_URI_TOO_LONG             = 414,
-	NNI_HTTP_STATUS_UNSUPPORTED_MEDIA_TYPE   = 415,
-	NNI_HTTP_STATUS_RANGE_NOT_SATISFIABLE    = 416,
-	NNI_HTTP_STATUS_EXPECTATION_FAILED       = 417,
-	NNI_HTTP_STATUS_TEAPOT                   = 418,
-	NNI_HTTP_STATUS_UNPROCESSABLE_ENTITY     = 422,
-	NNI_HTTP_STATUS_LOCKED                   = 423,
-	NNI_HTTP_STATUS_FAILED_DEPENDENCY        = 424,
-	NNI_HTTP_STATUS_UPGRADE_REQUIRED         = 426,
-	NNI_HTTP_STATUS_PRECONDITION_REQUIRED    = 428,
-	NNI_HTTP_STATUS_TOO_MANY_REQUESTS        = 429,
-	NNI_HTTP_STATUS_HEADERS_TOO_LARGE        = 431,
-	NNI_HTTP_STATUS_UNAVAIL_LEGAL_REASONS    = 451,
-	NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR    = 500,
-	NNI_HTTP_STATUS_NOT_IMPLEMENTED          = 501,
-	NNI_HTTP_STATUS_BAD_GATEWAY              = 502,
-	NNI_HTTP_STATUS_SERVICE_UNAVAILABLE      = 503,
-	NNI_HTTP_STATUS_GATEWAY_TIMEOUT          = 504,
-	NNI_HTTP_STATUS_HTTP_VERSION_NOT_SUPP    = 505,
-	NNI_HTTP_STATUS_VARIANT_ALSO_NEGOTIATES  = 506,
-	NNI_HTTP_STATUS_INSUFFICIENT_STORAGE     = 507,
-	NNI_HTTP_STATUS_LOOP_DETECTED            = 508,
-	NNI_HTTP_STATUS_NOT_EXTENDED             = 510,
-	NNI_HTTP_STATUS_NETWORK_AUTH_REQUIRED    = 511,
-};
 
 // An HTTP connection is a connection over which messages are exchanged.
 // Generally, clients send request messages, and then read responses.

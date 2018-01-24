@@ -39,7 +39,8 @@ TestMain("HTTP Client", {
 		So(nng_aio_alloc(&aio, NULL, NULL) == 0);
 		iaio = (nni_aio *) aio;
 
-		So(nni_url_parse(&url, "http://httpbin.org") == 0);
+		So(nni_url_parse(&url, "http://httpbin.org/encoding/utf8") ==
+		    0);
 		So(nni_http_client_init(&cli, url) == 0);
 		nni_http_client_connect(cli, iaio);
 		nng_aio_wait(aio);
@@ -53,22 +54,18 @@ TestMain("HTTP Client", {
 		});
 
 		Convey("We can initiate a message", {
-			nni_http_req *req;
+			nng_http_req *req;
 			nni_http_res *res;
+
 			So(http != NULL);
 
-			So(nni_http_req_init(&req) == 0);
+			So(nng_http_req_alloc(&req, url) == 0);
 			So(nni_http_res_init(&res) == 0);
 			Reset({
 				nni_http_close(http);
-				nni_http_req_fini(req);
+				nng_http_req_free(req);
 				nni_http_res_fini(res);
 			});
-			So(nni_http_req_set_method(req, "GET") == 0);
-			So(nni_http_req_set_version(req, "HTTP/1.1") == 0);
-			So(nni_http_req_set_uri(req, "/encoding/utf8") == 0);
-			So(nni_http_req_set_header(
-			       req, "Host", "httpbin.org") == 0);
 			nni_http_write_req(http, req, iaio);
 
 			nng_aio_wait(aio);

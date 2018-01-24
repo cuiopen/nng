@@ -48,7 +48,7 @@ struct nni_ws {
 	nni_aio *        connaio; // connect aio
 	nni_aio *        useraio; // user aio, during HTTP negotiation
 	nni_http *       http;
-	nni_http_req *   req;
+	nng_http_req *   req;
 	nni_http_res *   res;
 	char *           reqhdrs;
 	char *           reshdrs;
@@ -82,7 +82,7 @@ struct nni_ws_listener {
 // completion of an earlier connection.  (We don't want to establish
 // requests when we already have connects negotiating.)
 struct nni_ws_dialer {
-	nni_http_req *   req;
+	nng_http_req *   req;
 	nni_http_res *   res;
 	nni_http_client *client;
 	nni_mtx          mtx;
@@ -1043,7 +1043,7 @@ nni_ws_response(nni_ws *ws)
 	return (ws->res);
 }
 
-nni_http_req *
+nng_http_req *
 nni_ws_request(nni_ws *ws)
 {
 	return (ws->req);
@@ -1127,7 +1127,7 @@ ws_fini(void *arg)
 		nni_http_fini(ws->http);
 	}
 	if (ws->req) {
-		nni_http_req_fini(ws->req);
+		nng_http_req_free(ws->req);
 	}
 	if (ws->res) {
 		nni_http_res_fini(ws->res);
@@ -1211,17 +1211,17 @@ ws_http_cb_dialer(nni_ws *ws, nni_aio *aio)
 
 	status = nni_http_res_get_status(ws->res);
 	switch (status) {
-	case NNI_HTTP_STATUS_SWITCHING:
+	case NNG_HTTP_STATUS_SWITCHING:
 		break;
-	case NNI_HTTP_STATUS_FORBIDDEN:
-	case NNI_HTTP_STATUS_UNAUTHORIZED:
+	case NNG_HTTP_STATUS_FORBIDDEN:
+	case NNG_HTTP_STATUS_UNAUTHORIZED:
 		rv = NNG_EPERM;
 		goto err;
-	case NNI_HTTP_STATUS_NOT_FOUND:
-	case NNI_HTTP_STATUS_METHOD_NOT_ALLOWED:
+	case NNG_HTTP_STATUS_NOT_FOUND:
+	case NNG_HTTP_STATUS_METHOD_NOT_ALLOWED:
 		rv = NNG_ECONNREFUSED; // Treat these as refusals.
 		goto err;
-	case NNI_HTTP_STATUS_BAD_REQUEST:
+	case NNG_HTTP_STATUS_BAD_REQUEST:
 	default:
 		// Perhaps we should use NNG_ETRANERR...
 		rv = NNG_EPROTO;
@@ -1230,7 +1230,7 @@ ws_http_cb_dialer(nni_ws *ws, nni_aio *aio)
 
 	// Check that the server gave us back the right key.
 	rv = ws_make_accept(
-	    nni_http_req_get_header(ws->req, "Sec-WebSocket-Key"), wskey);
+	    nng_http_req_get_header(ws->req, "Sec-WebSocket-Key"), wskey);
 	if (rv != 0) {
 		goto err;
 	}
@@ -1361,7 +1361,7 @@ ws_handler(nni_aio *aio)
 	nni_ws_listener * l;
 	nni_ws *          ws;
 	nni_http *        http;
-	nni_http_req *    req;
+	nng_http_req *    req;
 	nni_http_res *    res;
 	nni_http_handler *h;
 	nni_http_ctx *    ctx;
@@ -1382,24 +1382,24 @@ ws_handler(nni_aio *aio)
 	}
 
 	// Now check the headers, etc.
-	if (strcmp(nni_http_req_get_version(req), "HTTP/1.1") != 0) {
-		status = NNI_HTTP_STATUS_HTTP_VERSION_NOT_SUPP;
+	if (strcmp(nng_http_req_get_version(req), "HTTP/1.1") != 0) {
+		status = NNG_HTTP_STATUS_HTTP_VERSION_NOT_SUPP;
 		goto err;
 	}
 
-	if (strcmp(nni_http_req_get_method(req), "GET") != 0) {
+	if (strcmp(nng_http_req_get_method(req), "GET") != 0) {
 		// HEAD request.  We can't really deal with it.
-		status = NNI_HTTP_STATUS_BAD_REQUEST;
+		status = NNG_HTTP_STATUS_BAD_REQUEST;
 		goto err;
 	}
 
-#define GETH(h) nni_http_req_get_header(req, h)
+#define GETH(h) nng_http_req_get_header(req, h)
 #define SETH(h, v) nni_http_res_set_header(res, h, v)
 
 	if ((((ptr = GETH("Content-Length")) != NULL) && (atoi(ptr) > 0)) ||
 	    (((ptr = GETH("Transfer-Encoding")) != NULL) &&
 	        (nni_strcasestr(ptr, "chunked") != NULL))) {
-		status = NNI_HTTP_STATUS_PAYLOAD_TOO_LARGE;
+		status = NNG_HTTP_STATUS_PAYLOAD_TOO_LARGE;
 		goto err;
 	}
 
@@ -1410,13 +1410,13 @@ ws_handler(nni_aio *aio)
 	    (!ws_contains_word(ptr, "upgrade")) ||
 	    ((ptr = GETH("Sec-WebSocket-Version")) == NULL) ||
 	    (strcmp(ptr, "13") != 0)) {
-		status = NNI_HTTP_STATUS_BAD_REQUEST;
+		status = NNG_HTTP_STATUS_BAD_REQUEST;
 		goto err;
 	}
 
 	if (((ptr = GETH("Sec-WebSocket-Key")) == NULL) ||
 	    (ws_make_accept(ptr, key) != 0)) {
-		status = NNI_HTTP_STATUS_BAD_REQUEST;
+		status = NNG_HTTP_STATUS_BAD_REQUEST;
 		goto err;
 	}
 
@@ -1427,37 +1427,37 @@ ws_handler(nni_aio *aio)
 	proto = GETH("Sec-WebSocket-Protocol");
 	if (proto == NULL) {
 		if (l->proto != NULL) {
-			status = NNI_HTTP_STATUS_BAD_REQUEST;
+			status = NNG_HTTP_STATUS_BAD_REQUEST;
 			goto err;
 		}
 	} else if ((l->proto == NULL) ||
 	    (!ws_contains_word(l->proto, proto))) {
-		status = NNI_HTTP_STATUS_BAD_REQUEST;
+		status = NNG_HTTP_STATUS_BAD_REQUEST;
 		goto err;
 	}
 
 	if ((rv = nni_http_res_init(&res)) != 0) {
 		// Give a chance to reply to client.
-		status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 		goto err;
 	}
 
 	if (nni_http_res_set_status(
-	        res, NNI_HTTP_STATUS_SWITCHING, "Switching Protocols") != 0) {
+	        res, NNG_HTTP_STATUS_SWITCHING, "Switching Protocols") != 0) {
 		nni_http_res_fini(res);
-		status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 		goto err;
 	}
 
 	if ((SETH("Connection", "Upgrade") != 0) ||
 	    (SETH("Upgrade", "websocket") != 0) ||
 	    (SETH("Sec-WebSocket-Accept", key) != 0)) {
-		status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 		nni_http_res_fini(res);
 		goto err;
 	}
 	if ((proto != NULL) && (SETH("Sec-WebSocket-Protocol", proto) != 0)) {
-		status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 		nni_http_res_fini(res);
 		goto err;
 	}
@@ -1471,7 +1471,7 @@ ws_handler(nni_aio *aio)
 		}
 
 		if (nni_http_res_get_status(res) !=
-		    NNI_HTTP_STATUS_SWITCHING) {
+		    NNG_HTTP_STATUS_SWITCHING) {
 			// The hook has decided to give back a different
 			// reply and we are not upgrading anymore.  For
 			// example the Origin might not be permitted, or
@@ -1479,7 +1479,7 @@ ws_handler(nni_aio *aio)
 			// (Note that the hook can also give back various
 			// other headers, but it would be bad for it to
 			// alter the websocket mandated headers.)
-			nni_http_req_fini(req);
+			nng_http_req_free(req);
 			nni_aio_set_output(aio, 0, res);
 			nni_aio_finish(aio, 0, 0);
 			return;
@@ -1492,9 +1492,9 @@ ws_handler(nni_aio *aio)
 	// We are good to go, provided we can get the websocket struct,
 	// and send the reply.
 	if ((rv = ws_init(&ws)) != 0) {
-		nni_http_req_fini(req);
+		nng_http_req_free(req);
 		nni_http_res_fini(res);
-		status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 		goto err;
 	}
 	ws->http = http;
@@ -1769,12 +1769,8 @@ ws_conn_cb(void *arg)
 	nni_base64_encode(raw, 16, wskey, 24);
 	wskey[24] = '\0';
 
-#define SETH(h, v) nni_http_req_set_header(req, h, v)
-	if ((rv != 0) || ((rv = nni_http_req_init(&req)) != 0) ||
-	    ((rv = nni_http_req_set_uri(req, d->url->u_rawpath)) != 0) ||
-	    ((rv = nni_http_req_set_version(req, "HTTP/1.1")) != 0) ||
-	    ((rv = nni_http_req_set_method(req, "GET")) != 0) ||
-	    ((rv = SETH("Host", d->url->u_host)) != 0) ||
+#define SETH(h, v) nng_http_req_set_header(req, h, v)
+	if ((rv != 0) || ((rv = nng_http_req_alloc(&req, d->url)) != 0) ||
 	    ((rv = SETH("Upgrade", "websocket")) != 0) ||
 	    ((rv = SETH("Connection", "Upgrade")) != 0) ||
 	    ((rv = SETH("Sec-WebSocket-Key", wskey)) != 0) ||
@@ -1808,7 +1804,7 @@ err:
 		nni_http_fini(http);
 	}
 	if (req != NULL) {
-		nni_http_req_fini(req);
+		nng_http_req_free(req);
 	}
 	nni_ws_fini(ws);
 }

@@ -225,7 +225,7 @@ static struct {
 	// clang-format on
 };
 
-static const char *
+const char *
 nni_url_default_port(const char *scheme)
 {
 	const char *s;

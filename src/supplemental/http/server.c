@@ -44,7 +44,7 @@ typedef struct nni_http_ctx {
 	nni_list_node    node;
 	nni_http *       http;
 	nni_http_server *server;
-	nni_http_req *   req;
+	nng_http_req *   req;
 	nni_http_res *   res;
 	bool             close;
 	bool             closed;
@@ -217,7 +217,7 @@ http_sconn_reap(void *arg)
 		nni_http_fini(sc->http);
 	}
 	if (sc->req != NULL) {
-		nni_http_req_fini(sc->req);
+		nng_http_req_free(sc->req);
 	}
 	if (sc->res != NULL) {
 		nni_http_res_fini(sc->res);
@@ -322,7 +322,7 @@ http_sconn_txdone(void *arg)
 
 	// For HEAD requests, we just treat like "GET" but don't send
 	// the data.  (Required per HTTP.)
-	if (strcmp(nni_http_req_get_method(sc->req), "HEAD") == 0) {
+	if (strcmp(nng_http_req_get_method(sc->req), "HEAD") == 0) {
 		size = 0;
 	} else {
 		nni_http_res_get_data(sc->res, &data, &size);
@@ -496,14 +496,14 @@ http_sconn_rxdone(void *arg)
 	// Validate the request -- it has to at least look like HTTP
 	// 1.x.  We flatly refuse to deal with HTTP 0.9, and we can't
 	// cope with HTTP/2.
-	if ((val = nni_http_req_get_version(req)) == NULL) {
+	if ((val = nng_http_req_get_version(req)) == NULL) {
 		sc->close = true;
-		http_sconn_error(sc, NNI_HTTP_STATUS_BAD_REQUEST);
+		http_sconn_error(sc, NNG_HTTP_STATUS_BAD_REQUEST);
 		return;
 	}
 	if (strncmp(val, "HTTP/1.", 7) != 0) {
 		sc->close = true;
-		http_sconn_error(sc, NNI_HTTP_STATUS_HTTP_VERSION_NOT_SUPP);
+		http_sconn_error(sc, NNG_HTTP_STATUS_HTTP_VERSION_NOT_SUPP);
 		return;
 	}
 	if (strcmp(val, "HTTP/1.1") != 0) {
@@ -516,7 +516,7 @@ http_sconn_rxdone(void *arg)
 
 	// If the connection was 1.0, or a connection: close was
 	// requested, then mark this close on our end.
-	if ((val = nni_http_req_get_header(req, "Connection")) != NULL) {
+	if ((val = nng_http_req_get_header(req, "Connection")) != NULL) {
 		// HTTP 1.1 says these have to be case insensitive
 		if (nni_strcasestr(val, "close") != NULL) {
 			// In theory this could falsely match some other weird
@@ -528,7 +528,7 @@ http_sconn_rxdone(void *arg)
 		}
 	}
 
-	val   = nni_http_req_get_uri(req);
+	val   = nng_http_req_get_uri(req);
 	urisz = strlen(val) + 1;
 	if ((uri = nni_alloc(urisz)) == NULL) {
 		http_sconn_close(sc); // out of memory
@@ -537,10 +537,10 @@ http_sconn_rxdone(void *arg)
 	strncpy(uri, val, urisz);
 	path = http_uri_canonify(uri);
 
-	host = nni_http_req_get_header(req, "Host");
+	host = nng_http_req_get_header(req, "Host");
 	if ((host == NULL) && (needhost)) {
 		// Per RFC 2616 14.23 we have to send 400 status here.
-		http_sconn_error(sc, NNI_HTTP_STATUS_BAD_REQUEST);
+		http_sconn_error(sc, NNG_HTTP_STATUS_BAD_REQUEST);
 		return;
 	}
 
@@ -594,7 +594,7 @@ http_sconn_rxdone(void *arg)
 			break;
 		}
 		// So, what about the method?
-		val = nni_http_req_get_method(req);
+		val = nng_http_req_get_method(req);
 		if (strcmp(val, h->method) == 0) {
 			break;
 		}
@@ -616,9 +616,9 @@ http_sconn_rxdone(void *arg)
 		nni_mtx_unlock(&s->mtx);
 		if (badmeth) {
 			http_sconn_error(
-			    sc, NNI_HTTP_STATUS_METHOD_NOT_ALLOWED);
+			    sc, NNG_HTTP_STATUS_METHOD_NOT_ALLOWED);
 		} else {
-			http_sconn_error(sc, NNI_HTTP_STATUS_NOT_FOUND);
+			http_sconn_error(sc, NNG_HTTP_STATUS_NOT_FOUND);
 		}
 		return;
 	}
@@ -1147,16 +1147,16 @@ http_handle_file(nni_aio *aio)
 		uint16_t status;
 		switch (rv) {
 		case NNG_ENOMEM:
-			status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+			status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 			break;
 		case NNG_ENOENT:
-			status = NNI_HTTP_STATUS_NOT_FOUND;
+			status = NNG_HTTP_STATUS_NOT_FOUND;
 			break;
 		case NNG_EPERM:
-			status = NNI_HTTP_STATUS_FORBIDDEN;
+			status = NNG_HTTP_STATUS_FORBIDDEN;
 			break;
 		default:
-			status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+			status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 			break;
 		}
 		if ((rv = nni_http_res_init_error(&res, status)) != 0) {
@@ -1168,7 +1168,7 @@ http_handle_file(nni_aio *aio)
 		return;
 	}
 	if (((rv = nni_http_res_init(&res)) != 0) ||
-	    ((rv = nni_http_res_set_status(res, NNI_HTTP_STATUS_OK, "OK")) !=
+	    ((rv = nni_http_res_set_status(res, NNG_HTTP_STATUS_OK, "OK")) !=
 	        0) ||
 	    ((rv = nni_http_res_set_header(res, "Content-Type", ctype)) !=
 	        0) ||
@@ -1257,7 +1257,7 @@ http_handle_directory(nni_aio *aio)
 	int               rv;
 	char *            path = nni_http_handler_get_data(h, 0);
 	const char *      base = nni_http_handler_get_data(h, 1); // base uri
-	const char *      uri  = nni_http_req_get_uri(req);
+	const char *      uri  = nng_http_req_get_uri(req);
 	const char *      ctype;
 	char *            dst;
 	size_t            len;
@@ -1335,16 +1335,16 @@ http_handle_directory(nni_aio *aio)
 
 		switch (rv) {
 		case NNG_ENOMEM:
-			status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+			status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 			break;
 		case NNG_ENOENT:
-			status = NNI_HTTP_STATUS_NOT_FOUND;
+			status = NNG_HTTP_STATUS_NOT_FOUND;
 			break;
 		case NNG_EPERM:
-			status = NNI_HTTP_STATUS_FORBIDDEN;
+			status = NNG_HTTP_STATUS_FORBIDDEN;
 			break;
 		default:
-			status = NNI_HTTP_STATUS_INTERNAL_SERVER_ERROR;
+			status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 			break;
 		}
 		if ((rv = nni_http_res_init_error(&res, status)) != 0) {
@@ -1357,7 +1357,7 @@ http_handle_directory(nni_aio *aio)
 	}
 
 	if (((rv = nni_http_res_init(&res)) != 0) ||
-	    ((rv = nni_http_res_set_status(res, NNI_HTTP_STATUS_OK, "OK")) !=
+	    ((rv = nni_http_res_set_status(res, NNG_HTTP_STATUS_OK, "OK")) !=
 	        0) ||
 	    ((rv = nni_http_res_set_header(res, "Content-Type", ctype)) !=
 	        0) ||
@@ -1433,7 +1433,7 @@ http_handle_static(nni_aio *aio)
 
 	if (((rv = nni_http_res_init(&r)) != 0) ||
 	    ((rv = nni_http_res_set_header(r, "Content-Type", ctype)) != 0) ||
-	    ((rv = nni_http_res_set_status(r, NNI_HTTP_STATUS_OK, "OK")) !=
+	    ((rv = nni_http_res_set_status(r, NNG_HTTP_STATUS_OK, "OK")) !=
 	        0) ||
 	    ((rv = nni_http_res_set_data(r, data, size)) != 0)) {
 		if (r != NULL) {

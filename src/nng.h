@@ -739,6 +739,127 @@ NNG_DECL void nng_url_free(nng_url *);
 // nng_url_clone clones a URL structure.
 NNG_DECL int nng_url_clone(nng_url **, const nng_url *);
 
+// HTTP API.  Only present if HTTP support compiled into the library.
+
+// HTTP status codes.  This list is not exhaustive.
+enum nng_http_status {
+	NNG_HTTP_STATUS_CONTINUE                 = 100,
+	NNG_HTTP_STATUS_SWITCHING                = 101,
+	NNG_HTTP_STATUS_PROCESSING               = 102,
+	NNG_HTTP_STATUS_OK                       = 200,
+	NNG_HTTP_STATUS_CREATED                  = 201,
+	NNG_HTTP_STATUS_ACCEPTED                 = 202,
+	NNG_HTTP_STATUS_NOT_AUTHORITATIVE        = 203,
+	NNG_HTTP_STATUS_NO_CONTENT               = 204,
+	NNG_HTTP_STATUS_RESET_CONTENT            = 205,
+	NNG_HTTP_STATUS_PARTIAL_CONTENT          = 206,
+	NNG_HTTP_STATUS_MULTI_STATUS             = 207,
+	NNG_HTTP_STATUS_ALREADY_REPORTED         = 208,
+	NNG_HTTP_STATUS_IM_USED                  = 226,
+	NNG_HTTP_STATUS_MULTIPLE_CHOICES         = 300,
+	NNG_HTTP_STATUS_STATUS_MOVED_PERMANENTLY = 301,
+	NNG_HTTP_STATUS_FOUND                    = 302,
+	NNG_HTTP_STATUS_SEE_OTHER                = 303,
+	NNG_HTTP_STATUS_NOT_MODIFIED             = 304,
+	NNG_HTTP_STATUS_USE_PROXY                = 305,
+	NNG_HTTP_STATUS_TEMPORARY_REDIRECT       = 307,
+	NNG_HTTP_STATUS_PERMANENT_REDIRECT       = 308,
+	NNG_HTTP_STATUS_BAD_REQUEST              = 400,
+	NNG_HTTP_STATUS_UNAUTHORIZED             = 401,
+	NNG_HTTP_STATUS_PAYMENT_REQUIRED         = 402,
+	NNG_HTTP_STATUS_FORBIDDEN                = 403,
+	NNG_HTTP_STATUS_NOT_FOUND                = 404,
+	NNG_HTTP_STATUS_METHOD_NOT_ALLOWED       = 405,
+	NNG_HTTP_STATUS_NOT_ACCEPTABLE           = 406,
+	NNG_HTTP_STATUS_PROXY_AUTH_REQUIRED      = 407,
+	NNG_HTTP_STATUS_REQUEST_TIMEOUT          = 408,
+	NNG_HTTP_STATUS_CONFLICT                 = 409,
+	NNG_HTTP_STATUS_GONE                     = 410,
+	NNG_HTTP_STATUS_LENGTH_REQUIRED          = 411,
+	NNG_HTTP_STATUS_PRECONDITION_FAILED      = 412,
+	NNG_HTTP_STATUS_PAYLOAD_TOO_LARGE        = 413,
+	NNG_HTTP_STATUS_ENTITY_TOO_LONG          = 414,
+	NNG_HTTP_STATUS_UNSUPPORTED_MEDIA_TYPE   = 415,
+	NNG_HTTP_STATUS_RANGE_NOT_SATISFIABLE    = 416,
+	NNG_HTTP_STATUS_EXPECTATION_FAILED       = 417,
+	NNG_HTTP_STATUS_TEAPOT                   = 418,
+	NNG_HTTP_STATUS_UNPROCESSABLE_ENTITY     = 422,
+	NNG_HTTP_STATUS_LOCKED                   = 423,
+	NNG_HTTP_STATUS_FAILED_DEPENDENCY        = 424,
+	NNG_HTTP_STATUS_UPGRADE_REQUIRED         = 426,
+	NNG_HTTP_STATUS_PRECONDITION_REQUIRED    = 428,
+	NNG_HTTP_STATUS_TOO_MANY_REQUESTS        = 429,
+	NNG_HTTP_STATUS_HEADERS_TOO_LARGE        = 431,
+	NNG_HTTP_STATUS_UNAVAIL_LEGAL_REASONS    = 451,
+	NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR    = 500,
+	NNG_HTTP_STATUS_NOT_IMPLEMENTED          = 501,
+	NNG_HTTP_STATUS_BAD_GATEWAY              = 502,
+	NNG_HTTP_STATUS_SERVICE_UNAVAILABLE      = 503,
+	NNG_HTTP_STATUS_GATEWAY_TIMEOUT          = 504,
+	NNG_HTTP_STATUS_HTTP_VERSION_NOT_SUPP    = 505,
+	NNG_HTTP_STATUS_VARIANT_ALSO_NEGOTIATES  = 506,
+	NNG_HTTP_STATUS_INSUFFICIENT_STORAGE     = 507,
+	NNG_HTTP_STATUS_LOOP_DETECTED            = 508,
+	NNG_HTTP_STATUS_NOT_EXTENDED             = 510,
+	NNG_HTTP_STATUS_NETWORK_AUTH_REQUIRED    = 511,
+};
+
+// nng_http_req represents an HTTP request.
+typedef struct nng_http_req nng_http_req;
+
+// nng_http_req_alloc creates a vanilla HTTP request object.  The object is
+// initialized with the given URL object for an HTTP/1.1 GET request by
+// default. It also adds the Host: header required for HTTP/1.1.
+NNG_DECL int nng_http_req_alloc(nng_http_req **, nng_url *);
+
+// nng_http_req_free frees an HTTP request object.
+NNG_DECL void nng_http_req_free(nng_http_req *);
+
+// nng_http_req_get_method returns the method.
+NNG_DECL const char *nng_http_req_get_method(nng_http_req *);
+
+// nng_http_req_get_version returns the version, usually HTTP/1.1.
+NNG_DECL const char *nng_http_req_get_version(nng_http_req *);
+
+// nng_http_req_get_uri returns the "abs-uri", which is URL without
+// the scheme, host, or port.
+NNG_DECL const char *nng_http_req_get_uri(nng_http_req *);
+
+// nng_http_req_set_header sets an HTTP header, replacing any previous value
+// that might have been present.
+NNG_DECL int nng_http_req_set_header(
+    nng_http_req *, const char *, const char *);
+
+// nng_http_req_add_header adds an HTTP header, without disrupting any other
+// with the same name that might have been present.
+NNG_DECL int nng_http_req_add_header(
+    nng_http_req *, const char *, const char *);
+
+// nng_http_req_del_header deletes all occurrences of a named header.
+NNG_DECL int nng_http_req_del_header(nng_http_req *, const char *);
+
+// nng_http_req_get_header looks up a header with the named, returns NULL
+// if not found.
+NNG_DECL const char *nng_http_req_get_header(nng_http_req *, const char *);
+
+// nng_http_req_set_method is used to change the method of a request.
+// The method should be an upper case HTTP method, like POST, or DELETE.
+NNG_DECL int nng_http_req_set_method(nng_http_req *, const char *);
+
+// nng_http_req_set_version is used to change the version of a request.
+// Normally the version is "HTTP/1.1".  Note that the framework does
+// not support HTTP/2 at all.
+NNG_DECL int nng_http_req_set_version(nng_http_req *, const char *);
+
+// nng_http_req_set_uri is used to change the URI of a request.  This
+// should be an "abs-uri", that is a path, plus query and fragment if
+// needed.  The scheme, host, and port don't belong here.  The URI should
+// start with a leading '/' per HTTP.
+NNG_DECL int nng_http_req_set_uri(nng_http_req *, const char *);
+
+// nng_http_res represents an HTTP response.
+typedef struct nng_http_res nng_http_res;
+
 #ifdef __cplusplus
 }
 #endif

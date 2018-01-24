@@ -14,14 +14,13 @@
 #include <stdbool.h>
 
 // Pre-defined types for some prototypes.  These are from other subsystems.
-typedef struct nni_http_req nni_http_req;
 typedef struct nni_http_res nni_http_res;
 
 typedef struct nni_ws          nni_ws;
 typedef struct nni_ws_listener nni_ws_listener;
 typedef struct nni_ws_dialer   nni_ws_dialer;
 
-typedef int (*nni_ws_listen_hook)(void *, nni_http_req *, nni_http_res *);
+typedef int (*nni_ws_listen_hook)(void *, nng_http_req *, nni_http_res *);
 
 // Specify URL as ws://[<host>][:port][/path]
 // If host is missing, INADDR_ANY is assumed.  If port is missing,
