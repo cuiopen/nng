@@ -85,6 +85,9 @@ nni_aio_fini(nni_aio *aio)
 		// At this point the AIO is done.
 		nni_cv_fini(&aio->a_cv);
 
+		nni_free(aio->a_ins_ex, aio->a_ins_nex);
+		nni_free(aio->a_outs_ex, aio->a_outs_nex);
+		nni_free(aio->a_udat_ex, aio->a_udat_nex);
 		NNI_FREE_STRUCT(aio);
 	}
 }
@@ -146,55 +149,83 @@ nni_aio_get_pipe(nni_aio *aio)
 	return (aio->a_pipe);
 }
 
-void
-nni_aio_set_data(nni_aio *aio, int index, void *data)
-{
-	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_user_data))) {
-		aio->a_user_data[index] = data;
+#define NNI_AIO_PUT(idx, data, base, vals, cnt)                  \
+	if (idx < NNI_NUM_ELEMENTS(base)) {                      \
+		base[idx] = data;                                \
+	} else {                                                 \
+		unsigned xi = idx - NNI_NUM_ELEMENTS(base);      \
+		if (xi >= cnt) {                                 \
+			unsigned ncnt, ocnt;                     \
+			void **  ndat;                           \
+			void **  odat;                           \
+			ncnt = xi + 4;                           \
+			ocnt = cnt;                              \
+			odat = vals;                             \
+                                                                 \
+			ndat = nni_alloc(ncnt * sizeof(void *)); \
+			if (ndat == NULL) {                      \
+				return (NNG_ENOMEM);             \
+			}                                        \
+			for (int i = 0; i < ocnt; i++) {         \
+				ndat[i] = odat[i];               \
+			}                                        \
+			for (int i = ocnt; i < ncnt; i++) {      \
+				ndat[i] = 0;                     \
+			}                                        \
+			vals = ndat;                             \
+			cnt  = ncnt;                             \
+			nni_free(odat, ocnt * sizeof(void *));   \
+		}                                                \
+		vals[xi] = data;                                 \
 	}
+
+#define NNI_AIO_GET(idx, base, vals, cnt)   \
+	if (idx < NNI_NUM_ELEMENTS(base)) { \
+		return (base[idx]);         \
+	}                                   \
+	idx -= NNI_NUM_ELEMENTS(base);      \
+	if (idx < cnt) {                    \
+		return (vals[idx]);         \
+	}                                   \
+	return (NULL);
+
+int
+nni_aio_set_input(nni_aio *aio, unsigned idx, void *data)
+{
+	NNI_AIO_PUT(idx, data, aio->a_ins, aio->a_ins_ex, aio->a_ins_nex);
+	return (0);
 }
 
 void *
-nni_aio_get_data(nni_aio *aio, int index)
+nni_aio_get_input(nni_aio *aio, unsigned idx)
 {
-	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_user_data))) {
-		return (aio->a_user_data[index]);
-	}
-	return (NULL);
+	NNI_AIO_GET(idx, aio->a_ins, aio->a_ins_ex, aio->a_ins_nex);
 }
 
-void
-nni_aio_set_input(nni_aio *aio, int index, void *data)
+int
+nni_aio_set_output(nni_aio *aio, unsigned idx, void *data)
 {
-	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_inputs))) {
-		aio->a_inputs[index] = data;
-	}
+	NNI_AIO_PUT(idx, data, aio->a_outs, aio->a_outs_ex, aio->a_outs_nex);
+	return (0);
 }
 
 void *
-nni_aio_get_input(nni_aio *aio, int index)
+nni_aio_get_output(nni_aio *aio, unsigned idx)
 {
-	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_inputs))) {
-		return (aio->a_inputs[index]);
-	}
-	return (NULL);
+	NNI_AIO_GET(idx, aio->a_outs, aio->a_outs_ex, aio->a_outs_nex);
 }
 
-void
-nni_aio_set_output(nni_aio *aio, int index, void *data)
+int
+nni_aio_set_data(nni_aio *aio, unsigned idx, void *data)
 {
-	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_outputs))) {
-		aio->a_outputs[index] = data;
-	}
+	NNI_AIO_PUT(idx, data, aio->a_udat, aio->a_udat_ex, aio->a_udat_nex);
+	return (0);
 }
 
 void *
-nni_aio_get_output(nni_aio *aio, int index)
+nni_aio_get_data(nni_aio *aio, unsigned idx)
 {
-	if ((index >= 0) && (index < NNI_NUM_ELEMENTS(aio->a_outputs))) {
-		return (aio->a_outputs[index]);
-	}
-	return (NULL);
+	NNI_AIO_GET(idx, aio->a_udat, aio->a_udat_ex, aio->a_udat_nex);
 }
 
 int
@@ -387,8 +418,8 @@ nni_aio_expire_add(nni_aio *aio)
 	nni_list *list = &nni_aio_expire_aios;
 	nni_aio * naio;
 
-	// This is a reverse walk of the list.  We're more likely to find
-	// a match at the end of the list.
+	// This is a reverse walk of the list.  We're more likely to
+	// find a match at the end of the list.
 	for (naio = nni_list_last(list); naio != NULL;
 	     naio = nni_list_prev(list, naio)) {
 		if (aio->a_expire >= naio->a_expire) {
@@ -430,7 +461,8 @@ nni_aio_expire_loop(void *arg)
 
 		now = nni_clock();
 		if (now < aio->a_expire) {
-			// Unexpired; the list is ordered, so we just wait.
+			// Unexpired; the list is ordered, so we just
+			// wait.
 			nni_cv_until(&nni_aio_expire_cv, aio->a_expire);
 			nni_mtx_unlock(&nni_aio_lk);
 			continue;
@@ -442,14 +474,14 @@ nni_aio_expire_loop(void *arg)
 
 		// Mark it as expiring.  This acts as a hold on
 		// the aio, similar to the consumers.  The actual taskq
-		// dispatch on completion won't occur until this is cleared,
-		// and the done flag won't be set either.
+		// dispatch on completion won't occur until this is
+		// cleared, and the done flag won't be set either.
 		aio->a_expiring = 1;
 		cancelfn        = aio->a_prov_cancel;
 
-		// Cancel any outstanding activity.  This is always non-NULL
-		// for a valid aio, and becomes NULL only when an AIO is
-		// already being canceled or finished.
+		// Cancel any outstanding activity.  This is always
+		// non-NULL for a valid aio, and becomes NULL only when
+		// an AIO is already being canceled or finished.
 		if (cancelfn != NULL) {
 			nni_mtx_unlock(&nni_aio_lk);
 			cancelfn(aio, NNG_ETIMEDOUT);

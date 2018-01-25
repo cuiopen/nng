@@ -1035,37 +1035,37 @@ nng_aio_alloc(nng_aio **app, void (*cb)(void *), void *arg)
 void
 nng_aio_free(nng_aio *ap)
 {
-	nni_aio_fini((nni_aio *) ap);
+	nni_aio_fini(ap);
 }
 
 int
 nng_aio_result(nng_aio *ap)
 {
-	return (nni_aio_result((nni_aio *) ap));
+	return (nni_aio_result(ap));
 }
 
 void
 nng_aio_stop(nng_aio *ap)
 {
-	nni_aio_stop((nni_aio *) ap);
+	nni_aio_stop(ap);
 }
 
 void
 nng_aio_wait(nng_aio *ap)
 {
-	nni_aio_wait((nni_aio *) ap);
+	nni_aio_wait(ap);
 }
 
 void
 nng_aio_cancel(nng_aio *ap)
 {
-	nni_aio_cancel((nni_aio *) ap, NNG_ECANCELED);
+	nni_aio_cancel(ap, NNG_ECANCELED);
 }
 
 void
 nng_aio_set_msg(nng_aio *ap, nng_msg *msg)
 {
-	nni_aio_set_msg((nni_aio *) ap, msg);
+	nni_aio_set_msg(ap, msg);
 }
 
 nng_msg *
@@ -1079,7 +1079,43 @@ nng_aio_set_timeout(nng_aio *ap, nng_duration dur)
 {
 	// Durations here are relative, since we have no notion of a
 	// common clock..
-	nni_aio_set_timeout((nni_aio *) ap, dur);
+	nni_aio_set_timeout(ap, dur);
+}
+
+int
+nng_aio_set_input(nng_aio *ap, unsigned idx, void *data)
+{
+	return (nni_aio_set_input(ap, idx, data));
+}
+
+void *
+nng_aio_get_input(nng_aio *ap, unsigned idx)
+{
+	return (nni_aio_get_input(ap, idx));
+}
+
+int
+nng_aio_set_output(nng_aio *ap, unsigned idx, void *data)
+{
+	return (nni_aio_set_output(ap, idx, data));
+}
+
+void *
+nng_aio_get_output(nng_aio *ap, unsigned idx)
+{
+	return (nni_aio_get_output(ap, idx));
+}
+
+int
+nng_aio_set_data(nng_aio *ap, unsigned idx, void *data)
+{
+	return (nni_aio_set_data(ap, idx, data));
+}
+
+void *
+nng_aio_get_data(nng_aio *ap, unsigned idx)
+{
+	return (nni_aio_get_data(ap, idx));
 }
 
 #if 0
