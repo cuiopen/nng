@@ -246,7 +246,7 @@ ws_pipe_peer(void *arg)
 // Servers use the HTTP server framework, and a request methodology.
 
 static int
-ws_hook(void *arg, nni_http_req *req, nni_http_res *res)
+ws_hook(void *arg, nng_http_req *req, nng_http_res *res)
 {
 	ws_ep * ep = arg;
 	ws_hdr *h;
@@ -255,7 +255,7 @@ ws_hook(void *arg, nni_http_req *req, nni_http_res *res)
 
 	NNI_LIST_FOREACH (&ep->headers, h) {
 		int rv;
-		rv = nni_http_res_set_header(res, h->name, h->value);
+		rv = nng_http_res_set_header(res, h->name, h->value);
 		if (rv != 0) {
 			return (rv);
 		}

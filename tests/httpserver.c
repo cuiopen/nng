@@ -30,7 +30,7 @@ cleanup(void)
 }
 
 static int
-httpdo(nni_url *url, nni_http_req *req, nni_http_res *res, void **datap,
+httpdo(nng_url *url, nng_http_req *req, nng_http_res *res, void **datap,
     size_t *sizep)
 {
 	int              rv;
@@ -64,8 +64,8 @@ httpdo(nni_url *url, nni_http_req *req, nni_http_res *res, void **datap,
 	}
 
 	clen = 0;
-	if ((nni_http_res_get_status(res) == NNG_HTTP_STATUS_OK) &&
-	    ((ptr = nni_http_res_get_header(res, "Content-Length")) != NULL)) {
+	if ((nng_http_res_get_status(res) == NNG_HTTP_STATUS_OK) &&
+	    ((ptr = nng_http_res_get_header(res, "Content-Length")) != NULL)) {
 		clen = atoi(ptr);
 	}
 
@@ -103,27 +103,27 @@ httpget(const char *addr, void **datap, size_t *sizep, uint16_t *statp,
     char **ctypep)
 {
 	int           rv;
-	nni_http_req *req   = NULL;
-	nni_http_res *res   = NULL;
-	nni_url *     url   = NULL;
+	nng_http_req *req   = NULL;
+	nng_http_res *res   = NULL;
+	nng_url *     url   = NULL;
 	size_t        clen  = 0;
 	void *        data  = NULL;
 	char *        ctype = NULL;
 	const char *  ptr;
 
-	if (((rv = nni_url_parse(&url, addr)) != 0) ||
+	if (((rv = nng_url_parse(&url, addr)) != 0) ||
 	    ((rv = nng_http_req_alloc(&req, url)) != 0) ||
-	    ((rv = nni_http_res_init(&res)) != 0)) {
+	    ((rv = nng_http_res_alloc(&res)) != 0)) {
 		goto fail;
 	}
 	if ((rv = httpdo(url, req, res, &data, &clen)) != 0) {
 		goto fail;
 	}
 
-	*statp = nni_http_res_get_status(res);
+	*statp = nng_http_res_get_status(res);
 
 	if (clen > 0) {
-		if ((ptr = nni_http_res_get_header(res, "Content-Type")) !=
+		if ((ptr = nng_http_res_get_header(res, "Content-Type")) !=
 		    NULL) {
 			ctype = nni_strdup(ptr);
 		}
@@ -147,7 +147,7 @@ fail:
 		nng_http_req_free(req);
 	}
 	if (res != NULL) {
-		nni_http_res_fini(res);
+		nng_http_res_free(res);
 	}
 
 	return (rv);
@@ -165,14 +165,14 @@ TestMain("HTTP Client", {
 		nni_aio *aio;
 		char     portbuf[16];
 		char     urlstr[32];
-		nni_url *url;
+		nng_url *url;
 
 		trantest_next_address(portbuf, "%u");
 
 		snprintf(
 		    urlstr, sizeof(urlstr), "http://127.0.0.1:%s", portbuf);
 
-		So(nni_url_parse(&url, urlstr) == 0);
+		So(nng_url_parse(&url, urlstr) == 0);
 		So(nni_aio_init(&aio, NULL, NULL) == 0);
 
 		So(nni_http_server_init(&s, url) == 0);
@@ -219,7 +219,7 @@ TestMain("HTTP Client", {
 			So(memcmp(data, doc1, size) == 0);
 			So(strcmp(ctype, "text/html") == 0);
 			nni_strfree(ctype);
-			nni_free(data, size);
+			nng_free(data, size);
 		});
 
 	});
@@ -228,7 +228,7 @@ TestMain("HTTP Client", {
 		nni_aio *aio;
 		char     portbuf[16];
 		char     urlstr[32];
-		nni_url *url;
+		nng_url *url;
 		char *   tmpdir;
 		char *   workdir;
 		char *   file1;
@@ -238,7 +238,7 @@ TestMain("HTTP Client", {
 		char *   subdir2;
 
 		trantest_next_address(urlstr, "http://127.0.0.1:%u");
-		So(nni_url_parse(&url, urlstr) == 0);
+		So(nng_url_parse(&url, urlstr) == 0);
 		So(nni_aio_init(&aio, NULL, NULL) == 0);
 		So(nni_http_server_init(&s, url) == 0);
 		So((tmpdir = nni_plat_temp_dir()) != NULL);
@@ -269,7 +269,7 @@ TestMain("HTTP Client", {
 			nni_strfree(file3);
 			nni_strfree(subdir1);
 			nni_strfree(subdir2);
-			nni_url_free(url);
+			nng_url_free(url);
 		});
 
 		So(nni_http_handler_init_directory(&h, "/docs", workdir) == 0);
@@ -292,7 +292,7 @@ TestMain("HTTP Client", {
 			So(memcmp(data, doc1, size) == 0);
 			So(strcmp(ctype, "text/html") == 0);
 			nni_strfree(ctype);
-			nni_free(data, size);
+			nng_free(data, size);
 		});
 
 		Convey("Index.htm works", {
@@ -310,7 +310,7 @@ TestMain("HTTP Client", {
 			So(memcmp(data, doc3, size) == 0);
 			So(strcmp(ctype, "text/html") == 0);
 			nni_strfree(ctype);
-			nni_free(data, size);
+			nng_free(data, size);
 		});
 
 		Convey("Named file works", {
@@ -328,7 +328,7 @@ TestMain("HTTP Client", {
 			So(memcmp(data, doc2, size) == 0);
 			So(strcmp(ctype, "text/plain") == 0);
 			nni_strfree(ctype);
-			nni_free(data, size);
+			nng_free(data, size);
 		});
 
 		Convey("Missing index gives 404", {
@@ -351,22 +351,22 @@ TestMain("HTTP Client", {
 			uint16_t      stat;
 			char *        ctype;
 			nng_http_req *req;
-			nni_http_res *res;
-			nni_url *     curl;
+			nng_http_res *res;
+			nng_url *     curl;
 
-			So(nni_http_res_init(&res) == 0);
+			So(nng_http_res_alloc(&res) == 0);
 			snprintf(fullurl, sizeof(fullurl), "%s/docs/", urlstr);
-			So(nni_url_parse(&curl, fullurl) == 0);
+			So(nng_url_parse(&curl, fullurl) == 0);
 			So(nng_http_req_alloc(&req, curl) == 0);
 			So(nng_http_req_set_method(req, "POST") == 0);
 
 			So(httpdo(curl, req, res, &data, &size) == 0);
-			So(nni_http_res_get_status(res) ==
+			So(nng_http_res_get_status(res) ==
 			    NNG_HTTP_STATUS_METHOD_NOT_ALLOWED);
 			So(size == 0);
 			nng_http_req_free(req);
-			nni_http_res_fini(res);
-			nni_url_free(curl);
+			nng_http_res_free(res);
+			nng_url_free(curl);
 		});
 		Convey("Version 0.9 gives 505", {
 			char          fullurl[256];
@@ -375,22 +375,22 @@ TestMain("HTTP Client", {
 			uint16_t      stat;
 			char *        ctype;
 			nng_http_req *req;
-			nni_http_res *res;
-			nni_url *     curl;
+			nng_http_res *res;
+			nng_url *     curl;
 
-			So(nni_http_res_init(&res) == 0);
+			So(nng_http_res_alloc(&res) == 0);
 			snprintf(fullurl, sizeof(fullurl), "%s/docs/", urlstr);
-			So(nni_url_parse(&curl, fullurl) == 0);
+			So(nng_url_parse(&curl, fullurl) == 0);
 			So(nng_http_req_alloc(&req, curl) == 0);
 			So(nng_http_req_set_version(req, "HTTP/0.9") == 0);
 
 			So(httpdo(curl, req, res, &data, &size) == 0);
-			So(nni_http_res_get_status(res) ==
+			So(nng_http_res_get_status(res) ==
 			    NNG_HTTP_STATUS_HTTP_VERSION_NOT_SUPP);
 			So(size == 0);
 			nng_http_req_free(req);
-			nni_http_res_fini(res);
-			nni_url_free(curl);
+			nng_http_res_free(res);
+			nng_url_free(curl);
 		});
 		Convey("Missing Host gives 400", {
 			char          fullurl[256];
@@ -399,22 +399,22 @@ TestMain("HTTP Client", {
 			uint16_t      stat;
 			char *        ctype;
 			nng_http_req *req;
-			nni_http_res *res;
-			nni_url *     curl;
+			nng_http_res *res;
+			nng_url *     curl;
 
-			So(nni_http_res_init(&res) == 0);
+			So(nng_http_res_alloc(&res) == 0);
 			snprintf(fullurl, sizeof(fullurl), "%s/docs/", urlstr);
-			So(nni_url_parse(&curl, fullurl) == 0);
+			So(nng_url_parse(&curl, fullurl) == 0);
 			So(nng_http_req_alloc(&req, curl) == 0);
 			So(nng_http_req_del_header(req, "Host") == 0);
 
 			So(httpdo(curl, req, res, &data, &size) == 0);
-			So(nni_http_res_get_status(res) ==
+			So(nng_http_res_get_status(res) ==
 			    NNG_HTTP_STATUS_BAD_REQUEST);
 			So(size == 0);
 			nng_http_req_free(req);
-			nni_http_res_fini(res);
-			nni_url_free(curl);
+			nng_http_res_free(res);
+			nng_url_free(curl);
 		});
 
 	});

@@ -13,38 +13,20 @@
 
 #include <stdbool.h>
 
-typedef struct nni_http_res nni_http_res;
-
-typedef struct nng_http_req nni_http_req;
-
 // These functions are private to the internal framework, and really should
 // not be used elsewhere.
-extern int   nni_http_req_init(nni_http_req **);
-extern void  nni_http_req_reset(nni_http_req *);
-extern int   nni_http_req_get_buf(nni_http_req *, void **, size_t *);
-extern int   nni_http_req_parse(nni_http_req *, void *, size_t, size_t *);
-extern char *nni_http_req_headers(nni_http_req *);
+extern int   nni_http_req_init(nng_http_req **);
+extern void  nni_http_req_reset(nng_http_req *);
+extern int   nni_http_req_get_buf(nng_http_req *, void **, size_t *);
+extern int   nni_http_req_parse(nng_http_req *, void *, size_t, size_t *);
+extern char *nni_http_req_headers(nng_http_req *);
+extern void  nni_http_req_get_data(nng_http_req *, void **, size_t *);
 
-extern int  nni_http_res_init(nni_http_res **);
-extern void nni_http_res_fini(nni_http_res *);
-extern void nni_http_res_reset(nni_http_res *);
-extern int  nni_http_res_get_buf(nni_http_res *, void **, size_t *);
-extern int nni_http_res_set_header(nni_http_res *, const char *, const char *);
-extern int nni_http_res_add_header(nni_http_res *, const char *, const char *);
-extern int nni_http_res_del_header(nni_http_res *, const char *);
-extern int nni_http_res_set_version(nni_http_res *, const char *);
-extern int nni_http_res_set_status(nni_http_res *, int, const char *);
-extern const char *nni_http_res_get_header(nni_http_res *, const char *);
-extern const char *nni_http_res_get_version(nni_http_res *);
-extern const char *nni_http_res_get_reason(nni_http_res *);
-extern int         nni_http_res_get_status(nni_http_res *);
-extern int   nni_http_res_parse(nni_http_res *, void *, size_t, size_t *);
-extern int   nni_http_res_set_data(nni_http_res *, const void *, size_t);
-extern int   nni_http_res_copy_data(nni_http_res *, const void *, size_t);
-extern int   nni_http_res_alloc_data(nni_http_res *, size_t);
-extern void  nni_http_res_get_data(nni_http_res *, void **, size_t *);
-extern int   nni_http_res_init_error(nni_http_res **, uint16_t);
-extern char *nni_http_res_headers(nni_http_res *);
+extern void  nni_http_res_reset(nng_http_res *);
+extern int   nni_http_res_get_buf(nng_http_res *, void **, size_t *);
+extern int   nni_http_res_parse(nng_http_res *, void *, size_t, size_t *);
+extern void  nni_http_res_get_data(nng_http_res *, void **, size_t *);
+extern char *nni_http_res_headers(nng_http_res *);
 
 // An HTTP connection is a connection over which messages are exchanged.
 // Generally, clients send request messages, and then read responses.
@@ -75,10 +57,10 @@ extern void nni_http_fini(nni_http *);
 // Note that the iovs of the aio's are clobbered by these methods -- callers
 // must not use them for any other purpose.
 
-extern void nni_http_write_req(nni_http *, nni_http_req *, nni_aio *);
-extern void nni_http_write_res(nni_http *, nni_http_res *, nni_aio *);
-extern void nni_http_read_req(nni_http *, nni_http_req *, nni_aio *);
-extern void nni_http_read_res(nni_http *, nni_http_res *, nni_aio *);
+extern void nni_http_write_req(nni_http *, nng_http_req *, nni_aio *);
+extern void nni_http_write_res(nni_http *, nng_http_res *, nni_aio *);
+extern void nni_http_read_req(nni_http *, nng_http_req *, nni_aio *);
+extern void nni_http_read_res(nni_http *, nng_http_res *, nni_aio *);
 
 extern void nni_http_read(nni_http *, nni_aio *);
 extern void nni_http_read_full(nni_http *, nni_aio *);
@@ -182,12 +164,12 @@ extern int nni_http_handler_init_file(
     nni_http_handler **, const char *, const char *);
 
 // nni_http_handler_init_file_ctype is like nni_http_handler_init_file, but
-// provides for settign the Content-Type explicitly (last argument).
+// provides for setting the Content-Type explicitly (last argument).
 extern int nni_http_handler_init_file_ctype(
     nni_http_handler **, const char *, const char *, const char *);
 
 // nni_http_handler_init_directory arranges to serve up an entire
-// directory tree.  The content types are determined from the builtin
+// directory tree.  The content types are determined from the built-in
 // content type list.  Actual directories are required to contain a
 // file called index.html or index.htm.  We do not generate directory
 // listings for security reasons.

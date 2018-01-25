@@ -45,7 +45,7 @@ typedef struct nni_http_ctx {
 	nni_http *       http;
 	nni_http_server *server;
 	nng_http_req *   req;
-	nni_http_res *   res;
+	nng_http_res *   res;
 	bool             close;
 	bool             closed;
 	bool             finished;
@@ -220,7 +220,7 @@ http_sconn_reap(void *arg)
 		nng_http_req_free(sc->req);
 	}
 	if (sc->res != NULL) {
-		nni_http_res_fini(sc->res);
+		nng_http_res_free(sc->res);
 	}
 	nni_aio_fini(sc->rxaio);
 	nni_aio_fini(sc->txaio);
@@ -293,7 +293,7 @@ http_sconn_txdatdone(void *arg)
 	}
 
 	if (sc->res != NULL) {
-		nni_http_res_fini(sc->res);
+		nng_http_res_free(sc->res);
 		sc->res = NULL;
 	}
 
@@ -320,6 +320,7 @@ http_sconn_txdone(void *arg)
 		return;
 	}
 
+#if 0
 	// For HEAD requests, we just treat like "GET" but don't send
 	// the data.  (Required per HTTP.)
 	if (strcmp(nng_http_req_get_method(sc->req), "HEAD") == 0) {
@@ -335,6 +336,7 @@ http_sconn_txdone(void *arg)
 		nni_http_write_full(sc->http, sc->txdataio);
 		return;
 	}
+#endif
 
 	if (sc->close) {
 		http_sconn_close(sc);
@@ -342,7 +344,7 @@ http_sconn_txdone(void *arg)
 	}
 
 	if (sc->res != NULL) {
-		nni_http_res_fini(sc->res);
+		nng_http_res_free(sc->res);
 		sc->res = NULL;
 	}
 	nni_http_req_reset(sc->req);
@@ -364,6 +366,7 @@ http_hexval(char c)
 	return (0);
 }
 
+// XXX: REPLACE THIS WITH CODE USING THE URL FRAMEWORK.
 static char *
 http_uri_canonify(char *path)
 {
@@ -428,15 +431,15 @@ http_uri_canonify(char *path)
 static void
 http_sconn_error(http_sconn *sc, uint16_t err)
 {
-	nni_http_res *res;
+	nng_http_res *res;
 
-	if (nni_http_res_init_error(&res, err) != 0) {
+	if (nng_http_res_alloc_error(&res, err) != 0) {
 		http_sconn_close(sc);
 		return;
 	}
 
 	if (sc->close) {
-		if (nni_http_res_set_header(res, "Connection", "close") != 0) {
+		if (nng_http_res_set_header(res, "Connection", "close") != 0) {
 			http_sconn_close(sc);
 		}
 	}
@@ -480,7 +483,7 @@ http_sconn_rxdone(void *arg)
 	nni_http_handler *h    = NULL;
 	nni_http_handler *head = NULL;
 	const char *      val;
-	nni_http_req *    req = sc->req;
+	nng_http_req *    req = sc->req;
 	char *            uri;
 	size_t            urisz;
 	char *            path;
@@ -541,6 +544,7 @@ http_sconn_rxdone(void *arg)
 	if ((host == NULL) && (needhost)) {
 		// Per RFC 2616 14.23 we have to send 400 status here.
 		http_sconn_error(sc, NNG_HTTP_STATUS_BAD_REQUEST);
+		nni_free(uri, urisz);
 		return;
 	}
 
@@ -645,7 +649,7 @@ http_sconn_cbdone(void *arg)
 {
 	http_sconn *      sc  = arg;
 	nni_aio *         aio = sc->cbaio;
-	nni_http_res *    res;
+	nng_http_res *    res;
 	nni_http_handler *h;
 	nni_http_server * s = sc->server;
 
@@ -676,14 +680,24 @@ http_sconn_cbdone(void *arg)
 	}
 	if (res != NULL) {
 		const char *val;
-		val = nni_http_res_get_header(res, "Connection");
+		val = nng_http_res_get_header(res, "Connection");
 		if ((val != NULL) && (strstr(val, "close") != NULL)) {
 			sc->close = true;
 		}
 		if (sc->close) {
-			nni_http_res_set_header(res, "Connection", "close");
+			nng_http_res_set_header(res, "Connection", "close");
 		}
 		sc->res = res;
+		if (strcmp(nng_http_req_get_method(sc->req), "HEAD") == 0) {
+			void * data;
+			size_t size;
+			// prune off the data, but preserve the content-length
+			// header.  By passing NULL here, we leave off the old
+			// data, but the non-zero size means we don't clobber
+			// the HTTP header.
+			nni_http_res_get_data(res, &data, &size);
+			nng_http_res_set_data(res, NULL, size);
+		}
 		nni_http_write_res(sc->http, res, sc->txaio);
 	} else if (sc->close) {
 		http_sconn_close(sc);
@@ -706,7 +720,7 @@ http_sconn_init(http_sconn **scp, nni_http_server *s, nni_plat_tcp_pipe *tcp)
 		return (NNG_ENOMEM);
 	}
 
-	if (((rv = nni_http_req_init(&sc->req)) != 0) ||
+	if (((rv = nng_http_req_alloc(&sc->req, NULL)) != 0) ||
 	    ((rv = nni_aio_init(&sc->rxaio, http_sconn_rxdone, sc)) != 0) ||
 	    ((rv = nni_aio_init(&sc->txaio, http_sconn_txdone, sc)) != 0) ||
 	    ((rv = nni_aio_init(&sc->txdataio, http_sconn_txdatdone, sc)) !=
@@ -1131,7 +1145,7 @@ static void
 http_handle_file(nni_aio *aio)
 {
 	nni_http_handler *h   = nni_aio_get_input(aio, 1);
-	nni_http_res *    res = NULL;
+	nng_http_res *    res = NULL;
 	void *            data;
 	size_t            size;
 	int               rv;
@@ -1159,7 +1173,7 @@ http_handle_file(nni_aio *aio)
 			status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 			break;
 		}
-		if ((rv = nni_http_res_init_error(&res, status)) != 0) {
+		if ((rv = nng_http_res_alloc_error(&res, status)) != 0) {
 			nni_aio_finish_error(aio, rv);
 			return;
 		}
@@ -1167,14 +1181,13 @@ http_handle_file(nni_aio *aio)
 		nni_aio_finish(aio, 0, 0);
 		return;
 	}
-	if (((rv = nni_http_res_init(&res)) != 0) ||
-	    ((rv = nni_http_res_set_status(res, NNG_HTTP_STATUS_OK, "OK")) !=
+	if (((rv = nng_http_res_alloc(&res)) != 0) ||
+	    ((rv = nng_http_res_set_status(res, NNG_HTTP_STATUS_OK)) != 0) ||
+	    ((rv = nng_http_res_set_header(res, "Content-Type", ctype)) !=
 	        0) ||
-	    ((rv = nni_http_res_set_header(res, "Content-Type", ctype)) !=
-	        0) ||
-	    ((rv = nni_http_res_copy_data(res, data, size)) != 0)) {
+	    ((rv = nng_http_res_copy_data(res, data, size)) != 0)) {
 		if (res != NULL) {
-			nni_http_res_fini(res);
+			nng_http_res_free(res);
 		}
 		nni_free(data, size);
 		nni_aio_finish_error(aio, rv);
@@ -1249,9 +1262,9 @@ http_directory_dtor(nni_http_handler *h)
 static void
 http_handle_directory(nni_aio *aio)
 {
-	nni_http_req *    req = nni_aio_get_input(aio, 0);
+	nng_http_req *    req = nni_aio_get_input(aio, 0);
 	nni_http_handler *h   = nni_aio_get_input(aio, 1);
-	nni_http_res *    res = NULL;
+	nng_http_res *    res = NULL;
 	void *            data;
 	size_t            size;
 	int               rv;
@@ -1347,7 +1360,7 @@ http_handle_directory(nni_aio *aio)
 			status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 			break;
 		}
-		if ((rv = nni_http_res_init_error(&res, status)) != 0) {
+		if ((rv = nng_http_res_alloc_error(&res, status)) != 0) {
 			nni_aio_finish_error(aio, rv);
 			return;
 		}
@@ -1356,14 +1369,13 @@ http_handle_directory(nni_aio *aio)
 		return;
 	}
 
-	if (((rv = nni_http_res_init(&res)) != 0) ||
-	    ((rv = nni_http_res_set_status(res, NNG_HTTP_STATUS_OK, "OK")) !=
+	if (((rv = nng_http_res_alloc(&res)) != 0) ||
+	    ((rv = nng_http_res_set_status(res, NNG_HTTP_STATUS_OK)) != 0) ||
+	    ((rv = nng_http_res_set_header(res, "Content-Type", ctype)) !=
 	        0) ||
-	    ((rv = nni_http_res_set_header(res, "Content-Type", ctype)) !=
-	        0) ||
-	    ((rv = nni_http_res_copy_data(res, data, size)) != 0)) {
+	    ((rv = nng_http_res_copy_data(res, data, size)) != 0)) {
 		if (res != NULL) {
-			nni_http_res_fini(res);
+			nng_http_res_free(res);
 		}
 		nni_free(data, size);
 		nni_aio_finish_error(aio, rv);
@@ -1419,7 +1431,7 @@ http_handle_static(nni_aio *aio)
 	size_t            size;
 	char *            ctype;
 	nni_http_handler *h;
-	nni_http_res *    r = NULL;
+	nng_http_res *    r = NULL;
 	int               rv;
 
 	h     = nni_aio_get_input(aio, 1);
@@ -1431,13 +1443,12 @@ http_handle_static(nni_aio *aio)
 		ctype = "application/octet-stream";
 	}
 
-	if (((rv = nni_http_res_init(&r)) != 0) ||
-	    ((rv = nni_http_res_set_header(r, "Content-Type", ctype)) != 0) ||
-	    ((rv = nni_http_res_set_status(r, NNG_HTTP_STATUS_OK, "OK")) !=
-	        0) ||
-	    ((rv = nni_http_res_set_data(r, data, size)) != 0)) {
+	if (((rv = nng_http_res_alloc(&r)) != 0) ||
+	    ((rv = nng_http_res_set_header(r, "Content-Type", ctype)) != 0) ||
+	    ((rv = nng_http_res_set_status(r, NNG_HTTP_STATUS_OK)) != 0) ||
+	    ((rv = nng_http_res_set_data(r, data, size)) != 0)) {
 		if (r != NULL) {
-			nni_http_res_fini(r);
+			nng_http_res_free(r);
 		}
 		nni_aio_finish_error(aio, rv);
 		return;

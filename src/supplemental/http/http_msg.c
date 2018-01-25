@@ -45,10 +45,10 @@ struct nng_http_req {
 	bool            parsed;
 };
 
-struct nni_http_res {
+struct nng_http_res {
 	nni_list        hdrs;
 	nni_http_entity data;
-	int             code;
+	uint16_t        code;
 	char *          rsn;
 	char *          vers;
 	char *          buf;
@@ -96,7 +96,7 @@ http_entity_reset(nni_http_entity *entity)
 }
 
 void
-nni_http_req_reset(nni_http_req *req)
+nni_http_req_reset(nng_http_req *req)
 {
 	http_headers_reset(&req->hdrs);
 	http_entity_reset(&req->data);
@@ -111,7 +111,7 @@ nni_http_req_reset(nni_http_req *req)
 }
 
 void
-nni_http_res_reset(nni_http_res *res)
+nni_http_res_reset(nng_http_res *res)
 {
 	http_headers_reset(&res->hdrs);
 	http_entity_reset(&res->data);
@@ -136,7 +136,7 @@ nng_http_req_free(nng_http_req *req)
 }
 
 void
-nni_http_res_fini(nni_http_res *res)
+nng_http_res_free(nng_http_res *res)
 {
 	nni_http_res_reset(res);
 	if (res->bufsz) {
@@ -162,13 +162,13 @@ http_del_header(nni_list *hdrs, const char *key)
 }
 
 int
-nng_http_req_del_header(nni_http_req *req, const char *key)
+nng_http_req_del_header(nng_http_req *req, const char *key)
 {
 	return (http_del_header(&req->hdrs, key));
 }
 
 int
-nni_http_res_del_header(nni_http_res *res, const char *key)
+nng_http_res_del_header(nng_http_res *res, const char *key)
 {
 	return (http_del_header(&res->hdrs, key));
 }
@@ -209,13 +209,13 @@ http_set_header(nni_list *hdrs, const char *key, const char *val)
 }
 
 int
-nng_http_req_set_header(nni_http_req *req, const char *key, const char *val)
+nng_http_req_set_header(nng_http_req *req, const char *key, const char *val)
 {
 	return (http_set_header(&req->hdrs, key, val));
 }
 
 int
-nni_http_res_set_header(nni_http_res *res, const char *key, const char *val)
+nng_http_res_set_header(nng_http_res *res, const char *key, const char *val)
 {
 	return (http_set_header(&res->hdrs, key, val));
 }
@@ -262,7 +262,7 @@ nng_http_req_add_header(nng_http_req *req, const char *key, const char *val)
 }
 
 int
-nni_http_res_add_header(nni_http_res *res, const char *key, const char *val)
+nng_http_res_add_header(nng_http_res *res, const char *key, const char *val)
 {
 	return (http_add_header(&res->hdrs, key, val));
 }
@@ -280,13 +280,13 @@ http_get_header(nni_list *hdrs, const char *key)
 }
 
 const char *
-nng_http_req_get_header(nni_http_req *req, const char *key)
+nng_http_req_get_header(nng_http_req *req, const char *key)
 {
 	return (http_get_header(&req->hdrs, key));
 }
 
 const char *
-nni_http_res_get_header(nni_http_res *res, const char *key)
+nng_http_res_get_header(nng_http_res *res, const char *key)
 {
 	return (http_get_header(&res->hdrs, key));
 }
@@ -342,19 +342,19 @@ http_entity_get_data(nni_http_entity *entity, void **datap, size_t *sizep)
 }
 
 void
-nni_http_req_get_data(nni_http_req *req, void **datap, size_t *sizep)
+nni_http_req_get_data(nng_http_req *req, void **datap, size_t *sizep)
 {
 	http_entity_get_data(&req->data, datap, sizep);
 }
 
 void
-nni_http_res_get_data(nni_http_res *res, void **datap, size_t *sizep)
+nni_http_res_get_data(nng_http_res *res, void **datap, size_t *sizep)
 {
 	http_entity_get_data(&res->data, datap, sizep);
 }
 
 int
-nni_http_req_set_data(nni_http_req *req, const void *data, size_t size)
+nng_http_req_set_data(nng_http_req *req, const void *data, size_t size)
 {
 	int rv;
 
@@ -366,7 +366,7 @@ nni_http_req_set_data(nni_http_req *req, const void *data, size_t size)
 }
 
 int
-nni_http_res_set_data(nni_http_res *res, const void *data, size_t size)
+nng_http_res_set_data(nng_http_res *res, const void *data, size_t size)
 {
 	int rv;
 
@@ -378,7 +378,7 @@ nni_http_res_set_data(nni_http_res *res, const void *data, size_t size)
 }
 
 int
-nni_http_req_copy_data(nni_http_req *req, const void *data, size_t size)
+nng_http_req_copy_data(nng_http_req *req, const void *data, size_t size)
 {
 	int rv;
 
@@ -391,7 +391,7 @@ nni_http_req_copy_data(nni_http_req *req, const void *data, size_t size)
 }
 
 int
-nni_http_res_copy_data(nni_http_res *res, const void *data, size_t size)
+nng_http_res_copy_data(nng_http_res *res, const void *data, size_t size)
 {
 	int rv;
 
@@ -401,12 +401,6 @@ nni_http_res_copy_data(nni_http_res *res, const void *data, size_t size)
 		return (rv);
 	}
 	return (0);
-}
-
-int
-nni_http_res_alloc_data(nni_http_res *res, size_t size)
-{
-	return (http_entity_alloc_data(&res->data, size));
 }
 
 static int
@@ -503,7 +497,7 @@ http_asprintf(char **bufp, size_t *szp, nni_list *hdrs, const char *fmt, ...)
 }
 
 static int
-http_req_prepare(nni_http_req *req)
+http_req_prepare(nng_http_req *req)
 {
 	int rv;
 	if (req->uri == NULL) {
@@ -516,7 +510,7 @@ http_req_prepare(nni_http_req *req)
 }
 
 static int
-http_res_prepare(nni_http_res *res)
+http_res_prepare(nng_http_res *res)
 {
 	int rv;
 	rv = http_asprintf(&res->buf, &res->bufsz, &res->hdrs, "%s %d %s\r\n",
@@ -526,7 +520,7 @@ http_res_prepare(nni_http_res *res)
 }
 
 char *
-nni_http_req_headers(nni_http_req *req)
+nni_http_req_headers(nng_http_req *req)
 {
 	char * s;
 	size_t len;
@@ -539,7 +533,7 @@ nni_http_req_headers(nni_http_req *req)
 }
 
 char *
-nni_http_res_headers(nni_http_res *res)
+nni_http_res_headers(nng_http_res *res)
 {
 	char * s;
 	size_t len;
@@ -552,7 +546,7 @@ nni_http_res_headers(nni_http_res *res)
 }
 
 int
-nni_http_req_get_buf(nni_http_req *req, void **data, size_t *szp)
+nni_http_req_get_buf(nng_http_req *req, void **data, size_t *szp)
 {
 	int rv;
 
@@ -565,7 +559,7 @@ nni_http_req_get_buf(nni_http_req *req, void **data, size_t *szp)
 }
 
 int
-nni_http_res_get_buf(nni_http_res *res, void **data, size_t *szp)
+nni_http_res_get_buf(nng_http_res *res, void **data, size_t *szp)
 {
 	int rv;
 
@@ -574,27 +568,6 @@ nni_http_res_get_buf(nni_http_res *res, void **data, size_t *szp)
 	}
 	*data = res->buf;
 	*szp  = strlen(res->buf);
-	return (0);
-}
-
-int
-nni_http_req_init(nni_http_req **reqp)
-{
-	nni_http_req *req;
-	if ((req = NNI_ALLOC_STRUCT(req)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	NNI_LIST_INIT(&req->hdrs, http_header, node);
-	req->buf       = NULL;
-	req->bufsz     = 0;
-	req->data.data = NULL;
-	req->data.size = 0;
-	req->data.own  = false;
-	req->vers      = NULL;
-	req->meth      = NULL;
-	req->uri       = NULL;
-	*reqp          = req;
-
 	return (0);
 }
 
@@ -615,30 +588,34 @@ nng_http_req_alloc(nng_http_req **reqp, nng_url *url)
 	req->data.own  = false;
 	req->vers      = NULL;
 	req->meth      = NULL;
-	if ((req->uri = nni_strdup(url->u_rawpath)) == NULL) {
-		NNI_FREE_STRUCT(req);
-		return (NNG_ENOMEM);
-	}
+	req->uri       = NULL;
+	if (url != NULL) {
+		if ((req->uri = nni_strdup(url->u_rawpath)) == NULL) {
+			NNI_FREE_STRUCT(req);
+			return (NNG_ENOMEM);
+		}
 
-	// Add a Host: header since we know that from the URL. Also, only
-	// include the :port portion if it isn't the default port.
-	if (strcmp(nni_url_default_port(url->u_scheme), url->u_port) == 0) {
-		host = url->u_hostname;
-	} else {
-		host = url->u_host;
-	}
-	if ((rv = nng_http_req_add_header(req, "Host", host)) != 0) {
-		nng_http_req_free(req);
-		return (rv);
+		// Add a Host: header since we know that from the URL. Also,
+		// only include the :port portion if it isn't the default port.
+		if (strcmp(nni_url_default_port(url->u_scheme), url->u_port) ==
+		    0) {
+			host = url->u_hostname;
+		} else {
+			host = url->u_host;
+		}
+		if ((rv = nng_http_req_add_header(req, "Host", host)) != 0) {
+			nng_http_req_free(req);
+			return (rv);
+		}
 	}
 	*reqp = req;
 	return (0);
 }
 
 int
-nni_http_res_init(nni_http_res **resp)
+nng_http_res_alloc(nng_http_res **resp)
 {
-	nni_http_res *res;
+	nng_http_res *res;
 	if ((res = NNI_ALLOC_STRUCT(res)) == NULL) {
 		return (NNG_ENOMEM);
 	}
@@ -662,19 +639,19 @@ nng_http_req_get_method(nng_http_req *req)
 }
 
 const char *
-nng_http_req_get_uri(nni_http_req *req)
+nng_http_req_get_uri(nng_http_req *req)
 {
 	return (req->uri != NULL ? req->uri : "");
 }
 
 const char *
-nng_http_req_get_version(nni_http_req *req)
+nng_http_req_get_version(nng_http_req *req)
 {
 	return (req->vers ? req->vers : "HTTP/1.1");
 }
 
 const char *
-nni_http_res_get_version(nni_http_res *res)
+nng_http_res_get_version(nng_http_res *res)
 {
 	return (res->vers ? res->vers : "HTTP/1.1");
 }
@@ -691,7 +668,7 @@ nng_http_req_set_version(nng_http_req *req, const char *vers)
 }
 
 int
-nni_http_res_set_version(nni_http_res *res, const char *vers)
+nng_http_res_set_version(nng_http_res *res, const char *vers)
 {
 	if (strcmp(vers, "HTTP/1.1") == 0) { // default version
 		nni_strfree(res->vers);
@@ -719,25 +696,16 @@ nng_http_req_set_method(nng_http_req *req, const char *meth)
 }
 
 int
-nni_http_res_set_status(nni_http_res *res, int status, const char *reason)
+nng_http_res_set_status(nng_http_res *res, uint16_t status)
 {
-	int rv;
-	if ((rv = http_set_string(&res->rsn, reason)) == 0) {
-		res->code = status;
-	}
-	return (rv);
+	res->code = status;
+	return (0);
 }
 
-int
-nni_http_res_get_status(nni_http_res *res)
+uint16_t
+nng_http_res_get_status(nng_http_res *res)
 {
 	return (res->code);
-}
-
-const char *
-nni_http_res_get_reason(nni_http_res *res)
-{
-	return (res->rsn != NULL ? res->rsn : "");
 }
 
 static int
@@ -774,7 +742,7 @@ http_scan_line(void *vbuf, size_t n, size_t *lenp)
 }
 
 static int
-http_req_parse_line(nni_http_req *req, void *line)
+http_req_parse_line(nng_http_req *req, void *line)
 {
 	int   rv;
 	char *method;
@@ -804,7 +772,7 @@ http_req_parse_line(nni_http_req *req, void *line)
 }
 
 static int
-http_res_parse_line(nni_http_res *res, uint8_t *line)
+http_res_parse_line(nng_http_res *res, uint8_t *line)
 {
 	int   rv;
 	char *reason;
@@ -830,8 +798,8 @@ http_res_parse_line(nni_http_res *res, uint8_t *line)
 		return (NNG_EPROTO);
 	}
 
-	if (((rv = nni_http_res_set_status(res, status, reason)) != 0) ||
-	    ((rv = nni_http_res_set_version(res, version)) != 0)) {
+	if (((rv = nng_http_res_set_status(res, (uint16_t) status)) != 0) ||
+	    ((rv = nng_http_res_set_version(res, version)) != 0)) {
 		return (rv);
 	}
 	res->parsed = true;
@@ -845,7 +813,7 @@ http_res_parse_line(nni_http_res *res, uint8_t *line)
 // be updated even in the face of errors (esp. NNG_EAGAIN, which is
 // not an error so much as a request for more data.)
 int
-nni_http_req_parse(nni_http_req *req, void *buf, size_t n, size_t *lenp)
+nni_http_req_parse(nng_http_req *req, void *buf, size_t n, size_t *lenp)
 {
 
 	size_t len = 0;
@@ -883,7 +851,7 @@ nni_http_req_parse(nni_http_req *req, void *buf, size_t n, size_t *lenp)
 }
 
 int
-nni_http_res_parse(nni_http_res *res, void *buf, size_t n, size_t *lenp)
+nni_http_res_parse(nng_http_res *res, void *buf, size_t n, size_t *lenp)
 {
 
 	size_t len = 0;
@@ -920,7 +888,7 @@ nni_http_res_parse(nni_http_res *res, void *buf, size_t n, size_t *lenp)
 }
 
 static struct {
-	int         code;
+	uint16_t    code;
 	const char *mesg;
 } http_status[] = {
 	// 200, listed first because most likely
@@ -997,16 +965,39 @@ static struct {
 	{ 0, NULL },
 };
 
+const char *
+http_reason(uint16_t code)
+{
+	for (int i = 0; http_status[i].code != 0; i++) {
+		if (http_status[i].code == code) {
+			return (http_status[i].mesg);
+		}
+	}
+	return ("Unknown HTTP Status");
+}
+
+const char *
+nng_http_res_get_reason(nng_http_res *res)
+{
+	return (res->rsn ? res->rsn : http_reason(res->code));
+}
+
 int
-nni_http_res_init_error(nni_http_res **resp, uint16_t err)
+nng_http_res_set_reason(nng_http_res *res, const char *reason)
+{
+	return (http_set_string(&res->rsn, reason));
+}
+
+int
+nng_http_res_alloc_error(nng_http_res **resp, uint16_t err)
 {
 	const char *  rsn;
 	char          rsnbuf[80];
 	char          html[1024];
 	int           rv;
-	nni_http_res *res;
+	nng_http_res *res;
 
-	if ((rv = nni_http_res_init(&res)) != 0) {
+	if ((rv = nng_http_res_alloc(&res)) != 0) {
 		return (rv);
 	}
 
@@ -1035,11 +1026,11 @@ nni_http_res_init_error(nni_http_res **resp, uint16_t err)
 	    "%s</span></p></body>",
 	    err, rsn, err, rsn);
 
-	if (((rv = nni_http_res_set_status(res, err, rsn)) != 0) ||
-	    ((rv = nni_http_res_set_header(
+	res->code = err;
+	if (((rv = nng_http_res_set_header(
 	          res, "Content-Type", "text/html; charset=UTF-8")) != 0) ||
-	    ((rv = nni_http_res_copy_data(res, html, strlen(html))) != 0)) {
-		nni_http_res_fini(res);
+	    ((rv = nng_http_res_copy_data(res, html, strlen(html))) != 0)) {
+		nng_http_res_free(res);
 	} else {
 		*resp = res;
 	}

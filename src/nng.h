@@ -246,6 +246,11 @@ NNG_DECL void nng_free(void *, size_t);
 // support asynchronous operations.  They contain the completion callback, and
 // a pointer to consumer data.  This is similar to how overlapped I/O
 // works in Windows, when used with a completion callback.
+//
+// AIO structures can carry up to 4 distinct input values, and up to
+// 4 distinct output values, and up to 4 distinct "private state" values.
+// The meaning of the inputs and the outputs are determined by the
+// I/O functions being called.
 
 // nng_aio_alloc allocates a new AIO, and associated the completion
 // callback and its opaque argument.  If NULL is supplied for the
@@ -289,6 +294,26 @@ NNG_DECL void nng_aio_set_msg(nng_aio *, nng_msg *);
 // nng_aio_get_msg returns the message structure associated with a completed
 // receive operation.
 NNG_DECL nng_msg *nng_aio_get_msg(nng_aio *);
+
+// nng_aio_set_input sets an input parameter at the given index.
+NNG_DECL int nng_aio_set_input(nng_aio *, unsigned, void *);
+
+// nng_aio_get_input retrieves the input parameter at the given index.
+NNG_DECL void *nng_aio_get_input(nng_aio *, unsigned);
+
+// nng_aio_set_output sets an output result at the given index.
+NNG_DECL int nng_aio_set_output(nng_aio *, unsigned, void *);
+
+// nng_aio_get_output retrieves the output result at the given index.
+NNG_DECL void *nng_aio_get_output(nng_aio *, unsigned);
+
+// nng_aio_set_data sets an opaque data at the given index.  The intention
+// is to allow consumers to pass additional state for use in callback
+// functions.
+NNG_DECL int nng_aio_set_data(nng_aio *, unsigned, void *);
+
+// nng_aio_get_data retrieves the data that was previously stored.
+NNG_DECL void *nng_aio_get_output(nng_aio *, unsigned);
 
 // nng_aio_set_timeout sets a timeout on the AIO.  This should be called for
 // operations that should time out after a period.  The timeout should be
@@ -809,7 +834,9 @@ typedef struct nng_http_req nng_http_req;
 
 // nng_http_req_alloc creates a vanilla HTTP request object.  The object is
 // initialized with the given URL object for an HTTP/1.1 GET request by
-// default. It also adds the Host: header required for HTTP/1.1.
+// default. It also adds the Host: header required for HTTP/1.1.  If the
+// url is NULL, then the uri and Host: header are uninitialized, and will
+// need to be set explicitly.
 NNG_DECL int nng_http_req_alloc(nng_http_req **, nng_url *);
 
 // nng_http_req_free frees an HTTP request object.
@@ -857,8 +884,121 @@ NNG_DECL int nng_http_req_set_version(nng_http_req *, const char *);
 // start with a leading '/' per HTTP.
 NNG_DECL int nng_http_req_set_uri(nng_http_req *, const char *);
 
+// nng_http_req_set_data adds entity data to the request.  The
+// data object must persist (so only really useful for static data).
+// The content-length header is updated as well, but the caller should
+// probably set the content-type header.
+NNG_DECL int nng_http_req_set_data(nng_http_req *, const void *, size_t);
+
+// nng_http_req_copy_data adds entity data to the response. A private
+// copy of the data is made (will be freed with the request).
+// The content-length header is updated as well, but the caller should
+// probably set the content-type header.
+NNG_DECL int nng_http_req_copy_data(nng_http_req *, const void *, size_t);
+
 // nng_http_res represents an HTTP response.
 typedef struct nng_http_res nng_http_res;
+
+// nng_http_res_alloc creates a vanilla HTTP response object.  The object is
+// initialized for an HTTP/1.1 response by default.
+NNG_DECL int nng_http_res_alloc(nng_http_res **);
+
+// nng_http_res_alloc_error creates an error HTTP response object.  The object
+// is initialized for an HTTP/1.1 response, and contains an associated
+// generic HTML error page.
+NNG_DECL int nng_http_res_alloc_error(nng_http_res **, uint16_t);
+
+// nng_http_res_free frees an HTTP response object.
+NNG_DECL void nng_http_res_free(nng_http_res *);
+
+// nng_http_res_get_status returns the HTTP status code from the server.
+NNG_DECL uint16_t nng_http_res_get_status(nng_http_res *);
+
+// nng_http_res_set_status sets the HTTP status code.
+NNG_DECL int nng_http_res_set_status(nng_http_res *, uint16_t);
+
+// nng_http_res_get_reason returns the human readable status message
+// that the server responds (or responded) with.
+NNG_DECL const char *nng_http_res_get_reason(nng_http_res *);
+
+// nng_http_res_set_header sets an HTTP header, replacing any previous value
+// that might have been present.
+NNG_DECL int nng_http_res_set_header(
+    nng_http_res *, const char *, const char *);
+
+// nng_http_res_add_header adds an HTTP header, without disrupting any other
+// with the same name that might have been present.
+NNG_DECL int nng_http_res_add_header(
+    nng_http_res *, const char *, const char *);
+
+// nng_http_res_del_header deletes all occurrences of a named header.
+NNG_DECL int nng_http_res_del_header(nng_http_res *, const char *);
+
+// nng_http_res_get_header looks up a header with the named, returns NULL
+// if not found.
+NNG_DECL const char *nng_http_res_get_header(nng_http_res *, const char *);
+
+// nng_http_res_set_version is used to change the version of a response.
+// Normally the version is "HTTP/1.1".  Note that the framework does
+// not support HTTP/2 at all.
+NNG_DECL int nng_http_res_set_version(nng_http_res *, const char *);
+
+// nng_http_res_get_version returns the version, usually HTTP/1.1.
+NNG_DECL const char *nng_http_res_get_version(nng_http_res *);
+
+// nng_http_res_set_data adds entity data to the response.  The
+// data object must persist (so only really useful for static data).
+// The content-length header is updated as well, but the caller should
+// probably set the content-type header.
+NNG_DECL int nng_http_res_set_data(nng_http_res *, const void *, size_t);
+
+// nng_http_res_copy_data adds entity data to the response. A private
+// copy of the data is made (will be freed with the request).
+// The content-length header is updated as well, but the caller should
+// probably set the content-type header.
+NNG_DECL int nng_http_res_copy_data(nng_http_res *, const void *, size_t);
+
+// An nng_http_conn represents an underlyinjg "connection".  It may be
+// a TCP channel, or a TLS channel, but the main thing is that this is
+// normally only used for exchanging HTTP requests and responses.
+typedef struct nng_http_conn nng_http_conn;
+
+// nng_http_conn_close closes the underlying channel.  Applications should
+// not use this channel after this operation is performed.
+NNG_DECL void nng_http_conn_close(nng_http_conn *);
+
+// nng_http_conn_read attempts to read data from the connection.  This is
+// a low-level non-blocking read, so it calls the aio completion as soon
+// as any data is present.
+NNG_DECL void nng_http_conn_read(nng_http_conn *, nng_aio *);
+
+// nng_http_conn_read_all is like nng_http_conn_read, but it does not
+// finish until either all the requested data is read, or an error occurs.
+NNG_DECL void nng_http_conn_read_all(nng_http_conn *, nng_aio *);
+
+// nng_http_conn_write attempts to write data from the connect, but it
+// can write less than the amount requested.
+NNG_DECL void nng_http_conn_write(nng_http_conn *, nng_aio *);
+
+// nng_http_conn_write_all is like nng_http_conn_write, but it does not
+// finish until either all the requested data is written, or an error occurs.
+NNG_DECL void nng_http_conn_write_all(nng_http_conn *, nng_aio *);
+
+// nng_http_conn_write_req writes the entire request.  It will also write any
+// data that has been attached.
+NNG_DECL void nng_http_conn_write_req(
+    nng_http_conn *, nng_http_req *, nng_aio *);
+
+// nng_http_conn_write_res writes the entire response.  It will also write any
+// data that has been attached.
+NNG_DECL void nng_http_conn_write_res(
+    nng_http_conn *, nng_http_req *, nng_aio *);
+
+// nng_http_conn_read_req reads an entire request, EXCEPT for any entity
+// data.  The caller is responsible for processing the headers in the request
+// and reading any submitted entity data itself.  The request structure
+NNG_DECL void nng_http_conn_read_req(
+    nng_http_conn *, nng_http_req *, nng_aio *);
 
 #ifdef __cplusplus
 }

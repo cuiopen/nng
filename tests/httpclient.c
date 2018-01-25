@@ -55,16 +55,16 @@ TestMain("HTTP Client", {
 
 		Convey("We can initiate a message", {
 			nng_http_req *req;
-			nni_http_res *res;
+			nng_http_res *res;
 
 			So(http != NULL);
 
 			So(nng_http_req_alloc(&req, url) == 0);
-			So(nni_http_res_init(&res) == 0);
+			So(nng_http_res_alloc(&res) == 0);
 			Reset({
 				nni_http_close(http);
 				nng_http_req_free(req);
-				nni_http_res_fini(res);
+				nng_http_res_free(res);
 			});
 			nni_http_write_req(http, req, iaio);
 
@@ -73,7 +73,7 @@ TestMain("HTTP Client", {
 			nni_http_read_res(http, res, iaio);
 			nng_aio_wait(aio);
 			So(nng_aio_result(aio) == 0);
-			So(nni_http_res_get_status(res) == 200);
+			So(nng_http_res_get_status(res) == 200);
 
 			Convey("The message contents are correct", {
 				uint8_t     digest[20];
@@ -81,7 +81,7 @@ TestMain("HTTP Client", {
 				const char *cstr;
 				size_t      sz;
 
-				cstr = nni_http_res_get_header(
+				cstr = nng_http_res_get_header(
 				    res, "Content-Length");
 				So(cstr != NULL);
 				sz = atoi(cstr);

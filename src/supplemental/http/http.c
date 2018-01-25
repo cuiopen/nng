@@ -481,7 +481,7 @@ http_wr_submit(nni_http *http, nni_aio *aio)
 }
 
 void
-nni_http_read_req(nni_http *http, nni_http_req *req, nni_aio *aio)
+nni_http_read_req(nni_http *http, nng_http_req *req, nni_aio *aio)
 {
 	SET_RD_FLAVOR(aio, HTTP_RD_REQ);
 	aio->a_prov_extra[1] = req;
@@ -492,7 +492,7 @@ nni_http_read_req(nni_http *http, nni_http_req *req, nni_aio *aio)
 }
 
 void
-nni_http_read_res(nni_http *http, nni_http_res *res, nni_aio *aio)
+nni_http_read_res(nni_http *http, nng_http_res *res, nni_aio *aio)
 {
 	SET_RD_FLAVOR(aio, HTTP_RD_RES);
 	aio->a_prov_extra[1] = res;
@@ -526,19 +526,28 @@ nni_http_read(nni_http *http, nni_aio *aio)
 }
 
 void
-nni_http_write_req(nni_http *http, nni_http_req *req, nni_aio *aio)
+nni_http_write_req(nni_http *http, nng_http_req *req, nni_aio *aio)
 {
 	int    rv;
 	void * buf;
 	size_t bufsz;
+	void * data;
+	size_t size;
 
 	if ((rv = nni_http_req_get_buf(req, &buf, &bufsz)) != 0) {
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
+	nni_http_req_get_data(req, &data, &size);
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;
+	if ((size > 0) && (data != NULL)) {
+		aio->a_niov++;
+		aio->a_iov[1].iov_len = size;
+		aio->a_iov[1].iov_buf = data;
+	}
+
 	SET_WR_FLAVOR(aio, HTTP_WR_REQ);
 
 	nni_mtx_lock(&http->mtx);
@@ -547,19 +556,27 @@ nni_http_write_req(nni_http *http, nni_http_req *req, nni_aio *aio)
 }
 
 void
-nni_http_write_res(nni_http *http, nni_http_res *res, nni_aio *aio)
+nni_http_write_res(nni_http *http, nng_http_res *res, nni_aio *aio)
 {
 	int    rv;
 	void * buf;
 	size_t bufsz;
+	void * data;
+	size_t size;
 
 	if ((rv = nni_http_res_get_buf(res, &buf, &bufsz)) != 0) {
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
+	nni_http_res_get_data(res, &data, &size);
 	aio->a_niov           = 1;
 	aio->a_iov[0].iov_len = bufsz;
 	aio->a_iov[0].iov_buf = buf;
+	if ((size > 0) && (data != NULL)) {
+		aio->a_niov++;
+		aio->a_iov[1].iov_len = size;
+		aio->a_iov[1].iov_buf = data;
+	}
 	SET_WR_FLAVOR(aio, HTTP_WR_RES);
 
 	nni_mtx_lock(&http->mtx);

@@ -49,7 +49,7 @@ struct nni_ws {
 	nni_aio *        useraio; // user aio, during HTTP negotiation
 	nni_http *       http;
 	nng_http_req *   req;
-	nni_http_res *   res;
+	nng_http_res *   res;
 	char *           reqhdrs;
 	char *           reshdrs;
 	size_t           maxframe;
@@ -83,7 +83,7 @@ struct nni_ws_listener {
 // requests when we already have connects negotiating.)
 struct nni_ws_dialer {
 	nng_http_req *   req;
-	nni_http_res *   res;
+	nng_http_res *   res;
 	nni_http_client *client;
 	nni_mtx          mtx;
 	char *           proto;
@@ -1037,7 +1037,7 @@ nni_ws_close(nni_ws *ws)
 	nni_ws_close_error(ws, WS_CLOSE_NORMAL_CLOSE);
 }
 
-nni_http_res *
+nng_http_res *
 nni_ws_response(nni_ws *ws)
 {
 	return (ws->res);
@@ -1130,7 +1130,7 @@ ws_fini(void *arg)
 		nng_http_req_free(ws->req);
 	}
 	if (ws->res) {
-		nni_http_res_fini(ws->res);
+		nng_http_res_free(ws->res);
 	}
 
 	nni_strfree(ws->reqhdrs);
@@ -1201,7 +1201,7 @@ ws_http_cb_dialer(nni_ws *ws, nni_aio *aio)
 	// If we have no response structure, then this was completion of the
 	// send of the request.  Prepare an empty response, and read it.
 	if (ws->res == NULL) {
-		if ((rv = nni_http_res_init(&ws->res)) != 0) {
+		if ((rv = nng_http_res_alloc(&ws->res)) != 0) {
 			goto err;
 		}
 		nni_http_read_res(ws->http, ws->res, ws->httpaio);
@@ -1209,7 +1209,7 @@ ws_http_cb_dialer(nni_ws *ws, nni_aio *aio)
 		return;
 	}
 
-	status = nni_http_res_get_status(ws->res);
+	status = nng_http_res_get_status(ws->res);
 	switch (status) {
 	case NNG_HTTP_STATUS_SWITCHING:
 		break;
@@ -1235,7 +1235,7 @@ ws_http_cb_dialer(nni_ws *ws, nni_aio *aio)
 		goto err;
 	}
 
-#define GETH(h) nni_http_res_get_header(ws->res, h)
+#define GETH(h) nng_http_res_get_header(ws->res, h)
 
 	if (((ptr = GETH("Sec-WebSocket-Accept")) == NULL) ||
 	    (strcmp(ptr, wskey) != 0) ||
@@ -1362,7 +1362,7 @@ ws_handler(nni_aio *aio)
 	nni_ws *          ws;
 	nni_http *        http;
 	nng_http_req *    req;
-	nni_http_res *    res;
+	nng_http_res *    res;
 	nni_http_handler *h;
 	nni_http_ctx *    ctx;
 	const char *      ptr;
@@ -1394,7 +1394,7 @@ ws_handler(nni_aio *aio)
 	}
 
 #define GETH(h) nng_http_req_get_header(req, h)
-#define SETH(h, v) nni_http_res_set_header(res, h, v)
+#define SETH(h, v) nng_http_res_set_header(res, h, v)
 
 	if ((((ptr = GETH("Content-Length")) != NULL) && (atoi(ptr) > 0)) ||
 	    (((ptr = GETH("Transfer-Encoding")) != NULL) &&
@@ -1436,15 +1436,14 @@ ws_handler(nni_aio *aio)
 		goto err;
 	}
 
-	if ((rv = nni_http_res_init(&res)) != 0) {
+	if ((rv = nng_http_res_alloc(&res)) != 0) {
 		// Give a chance to reply to client.
 		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 		goto err;
 	}
 
-	if (nni_http_res_set_status(
-	        res, NNG_HTTP_STATUS_SWITCHING, "Switching Protocols") != 0) {
-		nni_http_res_fini(res);
+	if (nng_http_res_set_status(res, NNG_HTTP_STATUS_SWITCHING) != 0) {
+		nng_http_res_free(res);
 		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 		goto err;
 	}
@@ -1453,24 +1452,24 @@ ws_handler(nni_aio *aio)
 	    (SETH("Upgrade", "websocket") != 0) ||
 	    (SETH("Sec-WebSocket-Accept", key) != 0)) {
 		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
-		nni_http_res_fini(res);
+		nng_http_res_free(res);
 		goto err;
 	}
 	if ((proto != NULL) && (SETH("Sec-WebSocket-Protocol", proto) != 0)) {
 		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
-		nni_http_res_fini(res);
+		nng_http_res_free(res);
 		goto err;
 	}
 
 	if (l->hookfn != NULL) {
 		rv = l->hookfn(l->hookarg, req, res);
 		if (rv != 0) {
-			nni_http_res_fini(res);
+			nng_http_res_free(res);
 			nni_aio_finish_error(aio, rv);
 			return;
 		}
 
-		if (nni_http_res_get_status(res) !=
+		if (nng_http_res_get_status(res) !=
 		    NNG_HTTP_STATUS_SWITCHING) {
 			// The hook has decided to give back a different
 			// reply and we are not upgrading anymore.  For
@@ -1493,7 +1492,7 @@ ws_handler(nni_aio *aio)
 	// and send the reply.
 	if ((rv = ws_init(&ws)) != 0) {
 		nng_http_req_free(req);
-		nni_http_res_fini(res);
+		nng_http_res_free(res);
 		status = NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR;
 		goto err;
 	}
@@ -1513,7 +1512,7 @@ ws_handler(nni_aio *aio)
 	return;
 
 err:
-	if ((rv = nni_http_res_init_error(&res, status)) != 0) {
+	if ((rv = nng_http_res_alloc_error(&res, status)) != 0) {
 		nni_aio_finish_error(aio, rv);
 	} else {
 		nni_aio_set_output(aio, 0, res);
@@ -1724,7 +1723,7 @@ ws_conn_cb(void *arg)
 	nni_ws *       ws;
 	nni_aio *      uaio;
 	nni_http *     http;
-	nni_http_req * req = NULL;
+	nng_http_req * req = NULL;
 	int            rv;
 	uint8_t        raw[16];
 	char           wskey[25];
