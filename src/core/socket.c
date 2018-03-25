@@ -19,11 +19,20 @@ static nni_list    nni_sock_list;
 static nni_idhash *nni_sock_hash;
 static nni_mtx     nni_sock_lk;
 
+struct nng_ctx {
+	nni_list_node     c_node;
+	nni_sock *        c_sock;
+	nni_proto_ctx_ops c_ops;
+	void *            c_data;
+	nng_duration      c_sndtimeo;
+	nng_duration      c_rcvtimeo;
+};
+
 typedef struct nni_socket_option {
 	const char *so_name;
 	int         so_type;
 	int (*so_getopt)(nni_sock *, void *, size_t *, int);
-	int (*so_setopt)(nni_sock *, const void *, size_t);
+	int (*so_setopt)(nni_sock *, const void *, size_t, int);
 } nni_socket_option;
 
 typedef struct nni_sockopt {
@@ -53,6 +62,7 @@ struct nni_socket {
 
 	nni_proto_pipe_ops s_pipe_ops;
 	nni_proto_sock_ops s_sock_ops;
+	nni_proto_ctx_ops  s_ctx_ops;
 
 	// options
 	nni_duration s_linger;    // linger time
@@ -66,6 +76,7 @@ struct nni_socket {
 
 	nni_list s_eps;   // active endpoints
 	nni_list s_pipes; // active pipes
+	nni_list s_ctxs;  // active contexts
 
 	int s_ep_pend; // EP dial/listen in progress
 	int s_closing; // Socket is closing
@@ -96,6 +107,32 @@ nni_sock_can_recv_cb(void *arg, int flags)
 		nni_plat_pipe_clear(fd->sn_rfd);
 	} else {
 		nni_plat_pipe_raise(fd->sn_wfd);
+	}
+}
+
+void
+nni_sock_set_sendable(nni_sock *s, bool cansend)
+{
+	nni_notifyfd *fd = &s->s_send_fd;
+	if (fd->sn_init) {
+		if (cansend) {
+			nni_plat_pipe_raise(fd->sn_wfd);
+		} else {
+			nni_plat_pipe_clear(fd->sn_rfd);
+		}
+	}
+}
+
+void
+nni_sock_set_recvable(nni_sock *s, bool canrecv)
+{
+	nni_notifyfd *fd = &s->s_recv_fd;
+	if (fd->sn_init) {
+		if (canrecv) {
+			nni_plat_pipe_raise(fd->sn_wfd);
+		} else {
+			nni_plat_pipe_clear(fd->sn_rfd);
+		}
 	}
 }
 
@@ -167,9 +204,9 @@ nni_sock_getopt_recvfd(nni_sock *s, void *buf, size_t *szp, int typ)
 }
 
 static int
-nni_sock_setopt_recvtimeo(nni_sock *s, const void *buf, size_t sz)
+nni_sock_setopt_recvtimeo(nni_sock *s, const void *buf, size_t sz, int typ)
 {
-	return (nni_setopt_ms(&s->s_rcvtimeo, buf, sz));
+	return (nni_copyin_ms(&s->s_rcvtimeo, buf, sz, typ));
 }
 
 static int
@@ -179,9 +216,9 @@ nni_sock_getopt_recvtimeo(nni_sock *s, void *buf, size_t *szp, int typ)
 }
 
 static int
-nni_sock_setopt_sendtimeo(nni_sock *s, const void *buf, size_t sz)
+nni_sock_setopt_sendtimeo(nni_sock *s, const void *buf, size_t sz, int typ)
 {
-	return (nni_setopt_ms(&s->s_sndtimeo, buf, sz));
+	return (nni_copyin_ms(&s->s_sndtimeo, buf, sz, typ));
 }
 
 static int
@@ -191,9 +228,9 @@ nni_sock_getopt_sendtimeo(nni_sock *s, void *buf, size_t *szp, int typ)
 }
 
 static int
-nni_sock_setopt_reconnmint(nni_sock *s, const void *buf, size_t sz)
+nni_sock_setopt_reconnmint(nni_sock *s, const void *buf, size_t sz, int typ)
 {
-	return (nni_setopt_ms(&s->s_reconn, buf, sz));
+	return (nni_copyin_ms(&s->s_reconn, buf, sz, typ));
 }
 
 static int
@@ -203,9 +240,9 @@ nni_sock_getopt_reconnmint(nni_sock *s, void *buf, size_t *szp, int typ)
 }
 
 static int
-nni_sock_setopt_reconnmaxt(nni_sock *s, const void *buf, size_t sz)
+nni_sock_setopt_reconnmaxt(nni_sock *s, const void *buf, size_t sz, int typ)
 {
-	return (nni_setopt_ms(&s->s_reconnmax, buf, sz));
+	return (nni_copyin_ms(&s->s_reconnmax, buf, sz, typ));
 }
 
 static int
@@ -215,9 +252,15 @@ nni_sock_getopt_reconnmaxt(nni_sock *s, void *buf, size_t *szp, int typ)
 }
 
 static int
-nni_sock_setopt_recvbuf(nni_sock *s, const void *buf, size_t sz)
+nni_sock_setopt_recvbuf(nni_sock *s, const void *buf, size_t sz, int typ)
 {
-	return (nni_setopt_buf(s->s_urq, buf, sz));
+	int len;
+	int rv;
+
+	if ((rv = nni_copyin_int(&len, buf, sz, 0, 8192, typ)) != 0) {
+		return (rv);
+	}
+	return (nni_msgq_resize(s->s_urq, len));
 }
 
 static int
@@ -229,9 +272,15 @@ nni_sock_getopt_recvbuf(nni_sock *s, void *buf, size_t *szp, int typ)
 }
 
 static int
-nni_sock_setopt_sendbuf(nni_sock *s, const void *buf, size_t sz)
+nni_sock_setopt_sendbuf(nni_sock *s, const void *buf, size_t sz, int typ)
 {
-	return (nni_setopt_buf(s->s_uwq, buf, sz));
+	int len;
+	int rv;
+
+	if ((rv = nni_copyin_int(&len, buf, sz, 0, 8192, typ)) != 0) {
+		return (rv);
+	}
+	return (nni_msgq_resize(s->s_uwq, len));
 }
 
 static int
@@ -249,13 +298,9 @@ nni_sock_getopt_sockname(nni_sock *s, void *buf, size_t *szp, int typ)
 }
 
 static int
-nni_sock_setopt_sockname(nni_sock *s, const void *buf, size_t sz)
+nni_sock_setopt_sockname(nni_sock *s, const void *buf, size_t sz, int typ)
 {
-	if (nni_strnlen(buf, sz) > sizeof(s->s_name) - 1) {
-		return (NNG_EINVAL);
-	}
-	nni_strlcpy(s->s_name, buf, sizeof(s->s_name));
-	return (0);
+	return (nni_copyin_str(s->s_name, buf, sizeof(s->s_name), sz, typ));
 }
 
 static const nni_socket_option nni_sock_options[] = {
@@ -516,6 +561,10 @@ nni_sock_create(nni_sock **sp, const nni_proto *proto)
 	s->s_sock_ops        = *proto->proto_sock_ops;
 	s->s_pipe_ops        = *proto->proto_pipe_ops;
 
+	if (proto->proto_ctx_ops != NULL) {
+		s->s_ctx_ops = *proto->proto_ctx_ops;
+	}
+
 	NNI_ASSERT(s->s_sock_ops.sock_open != NULL);
 	NNI_ASSERT(s->s_sock_ops.sock_close != NULL);
 
@@ -524,6 +573,7 @@ nni_sock_create(nni_sock **sp, const nni_proto *proto)
 
 	NNI_LIST_NODE_INIT(&s->s_node);
 	NNI_LIST_INIT(&s->s_options, nni_sockopt, node);
+	NNI_LIST_INIT(&s->s_ctxs, nng_ctx, c_node);
 	nni_pipe_sock_list_init(&s->s_pipes);
 	nni_ep_list_init(&s->s_eps);
 	nni_mtx_init(&s->s_mx);
@@ -748,7 +798,7 @@ nni_sock_close(nni_sock *s)
 	}
 	nni_mtx_unlock(&nni_sock_lk);
 
-	// Wait for pipe and eps to finish closing.
+	// Wait for pipes, eps, and contexts to finish closing.
 	nni_mtx_lock(&s->s_mx);
 	while (
 	    (!nni_list_empty(&s->s_pipes)) || (!nni_list_empty(&s->s_eps))) {
@@ -895,12 +945,7 @@ nni_sock_setopt(nni_sock *s, const char *name, const void *v, size_t sz, int t)
 			nni_mtx_unlock(&s->s_mx);
 			return (NNG_EREADONLY);
 		}
-		if ((pso->pso_type != NNI_TYPE_OPAQUE) &&
-		    (t != NNI_TYPE_OPAQUE) && (t != pso->pso_type)) {
-			nni_mtx_unlock(&s->s_mx);
-			return (NNG_EBADTYPE);
-		}
-		rv = pso->pso_setopt(s->s_data, v, sz);
+		rv = pso->pso_setopt(s->s_data, v, sz, t);
 		nni_mtx_unlock(&s->s_mx);
 		return (rv);
 	}
@@ -914,12 +959,7 @@ nni_sock_setopt(nni_sock *s, const char *name, const void *v, size_t sz, int t)
 			nni_mtx_unlock(&s->s_mx);
 			return (NNG_EREADONLY);
 		}
-		if ((sso->so_type != NNI_TYPE_OPAQUE) &&
-		    (t != NNI_TYPE_OPAQUE) && (t != sso->so_type)) {
-			nni_mtx_unlock(&s->s_mx);
-			return (NNG_EBADTYPE);
-		}
-		rv = sso->so_setopt(s, v, sz);
+		rv = sso->so_setopt(s, v, sz, t);
 		nni_mtx_unlock(&s->s_mx);
 		return (rv);
 	}
@@ -933,17 +973,19 @@ nni_sock_setopt(nni_sock *s, const char *name, const void *v, size_t sz, int t)
 
 	// Validation of transport options.  This is stateless, so transports
 	// should not fail to set an option later if they passed it here.
-	rv = nni_tran_chkopt(name, v, sz);
+	rv = nni_tran_chkopt(name, v, sz, t);
 
 	// Also check a few generic things.  We do this if no transport
 	// was found, or even if a transport rejected one of the settings.
 	if ((rv == NNG_ENOTSUP) || (rv == 0)) {
 		if ((strcmp(name, NNG_OPT_LINGER) == 0)) {
-			rv = nni_chkopt_ms(v, sz);
+			nng_duration d;
+			rv = nni_copyin_ms(&d, v, sz, t);
 		} else if (strcmp(name, NNG_OPT_RECVMAXSZ) == 0) {
+			size_t z;
 			// just a sanity test on the size; it also ensures that
 			// a size can be set even with no transport configured.
-			rv = nni_chkopt_size(v, sz, 0, NNI_MAXSZ);
+			rv = nni_copyin_size(&z, v, sz, 0, NNI_MAXSZ, t);
 		}
 	}
 
@@ -1014,7 +1056,7 @@ nni_sock_setopt(nni_sock *s, const char *name, const void *v, size_t sz, int t)
 	// will already have had a chance to veto this.
 
 	if (strcmp(name, NNG_OPT_LINGER) == 0) {
-		rv = nni_setopt_ms(&s->s_linger, v, sz);
+		rv = nni_copyin_ms(&s->s_linger, v, sz, t);
 	}
 
 	if (rv == 0) {
@@ -1105,4 +1147,139 @@ uint32_t
 nni_sock_flags(nni_sock *sock)
 {
 	return (sock->s_flags);
+}
+
+int
+nni_ctx_open(nni_ctx **ctxp, nni_sock *sock)
+{
+	nni_ctx *ctx;
+	int      rv;
+
+	if (sock->s_ctx_ops.ctx_init == NULL) {
+		return (NNG_ENOTSUP);
+	}
+	if ((ctx = NNI_ALLOC_STRUCT(ctx)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+	nni_mtx_lock(&sock->s_mx);
+	if (sock->s_closed) {
+		nni_mtx_unlock(&sock->s_mx);
+		return (NNG_ECLOSED);
+	}
+	rv = sock->s_ctx_ops.ctx_init(&ctx->c_data, sock->s_data);
+	if (rv != 0) {
+		nni_mtx_unlock(&sock->s_mx);
+		NNI_FREE_STRUCT(ctx);
+		return (rv);
+	}
+
+	sock->s_refcnt++;
+	ctx->c_sock     = sock;
+	ctx->c_ops      = sock->s_ctx_ops;
+	ctx->c_rcvtimeo = sock->s_rcvtimeo;
+	ctx->c_sndtimeo = sock->s_sndtimeo;
+	nni_mtx_unlock(&sock->s_mx);
+	*ctxp = ctx;
+
+	return (0);
+}
+
+void
+nni_ctx_close(nni_ctx *ctx)
+{
+	nni_sock *sock = ctx->c_sock;
+	void *    data;
+	nni_mtx_lock(&sock->s_mx);
+	if ((data = ctx->c_data) != NULL) {
+		ctx->c_data = NULL;
+		ctx->c_ops.ctx_fini(data);
+	}
+	nni_list_remove(&sock->s_ctxs, ctx);
+	sock->s_refcnt--;
+	if (nni_list_empty(&sock->s_ctxs)) {
+		nni_cv_wake(&sock->s_close_cv);
+	}
+	nni_mtx_unlock(&sock->s_mx);
+	NNI_FREE_STRUCT(ctx);
+}
+
+void
+nni_ctx_send(nni_ctx *ctx, nni_aio *aio)
+{
+	nni_aio_normalize_timeout(aio, ctx->c_sndtimeo);
+	ctx->c_ops.ctx_send(ctx->c_data, aio);
+}
+
+void
+nni_ctx_recv(nni_ctx *ctx, nni_aio *aio)
+{
+	nni_aio_normalize_timeout(aio, ctx->c_rcvtimeo);
+	ctx->c_ops.ctx_recv(ctx->c_data, aio);
+}
+
+int
+nni_ctx_getopt(nni_ctx *ctx, const char *opt, void *v, size_t *szp, int typ)
+{
+	nni_sock *            sock = ctx->c_sock;
+	nni_proto_ctx_option *co;
+	int                   rv;
+
+	nni_mtx_lock(&sock->s_mx);
+	if (sock->s_closing) {
+		rv = NNG_ECLOSED;
+	} else if (strcmp(opt, NNG_OPT_RECVTIMEO) == 0) {
+		rv = nni_copyout_ms(ctx->c_rcvtimeo, v, szp, typ);
+	} else if (strcmp(opt, NNG_OPT_SENDTIMEO) == 0) {
+		rv = nni_copyout_ms(ctx->c_sndtimeo, v, szp, typ);
+	} else {
+		rv = NNG_ENOTSUP;
+		for (co = ctx->c_ops.ctx_options; co->co_name != NULL; co++) {
+			if (strcmp(opt, co->co_name) != 0) {
+				continue;
+			}
+			if (co->co_getopt == NULL) {
+				rv = NNG_EWRITEONLY;
+				break;
+			}
+			rv = co->co_getopt(ctx->c_data, v, szp, typ);
+			break;
+		}
+	}
+
+	nni_mtx_unlock(&sock->s_mx);
+	return (rv);
+}
+
+int
+nni_ctx_setopt(
+    nni_ctx *ctx, const char *opt, const void *v, size_t sz, int typ)
+{
+	nni_sock *            sock = ctx->c_sock;
+	nni_proto_ctx_option *co;
+	int                   rv;
+
+	nni_mtx_lock(&sock->s_mx);
+	if (sock->s_closing) {
+		rv = NNG_ECLOSED;
+	} else if (strcmp(opt, NNG_OPT_RECVTIMEO) == 0) {
+		rv = nni_copyin_ms(&ctx->c_rcvtimeo, v, sz, typ);
+	} else if (strcmp(opt, NNG_OPT_SENDTIMEO) == 0) {
+		rv = nni_copyin_ms(&ctx->c_sndtimeo, v, sz, typ);
+	} else {
+		rv = NNG_ENOTSUP;
+		for (co = ctx->c_ops.ctx_options; co->co_name != NULL; co++) {
+			if (strcmp(opt, co->co_name) != 0) {
+				continue;
+			}
+			if (co->co_setopt == NULL) {
+				rv = NNG_EREADONLY;
+				break;
+			}
+			rv = co->co_setopt(ctx->c_data, v, sz, typ);
+			break;
+		}
+	}
+
+	nni_mtx_unlock(&sock->s_mx);
+	return (rv);
 }

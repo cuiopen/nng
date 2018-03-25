@@ -63,4 +63,31 @@ extern void nni_sock_reconntimes(nni_sock *, nni_duration *, nni_duration *);
 // nni_sock_flags returns the socket flags, used to indicate whether read
 // and or write are appropriate for the protocol.
 extern uint32_t nni_sock_flags(nni_sock *);
+
+// nni_sock_set_recvable is used to update the receivable state on the socket.
+// This is for protocols to use when they bypass the upper read queue.
+extern void nni_sock_set_recvable(nni_sock *, bool);
+
+// nni_sock_set_sendable is used to update the sendable state on the socket.
+// This is for protocols to use when they bypass the upper write queue.
+extern void nni_sock_set_sendable(nni_sock *, bool);
+
+// nni_ctx_open is used to open/create a new context structure.
+// Contexts are not supported by most protocols, but for those that do,
+// this can offer some improvements for massive concurrency/scalability.
+// Returns ENOTSUP for protocols that lack context support.
+extern int nni_ctx_open(nni_ctx **, nni_sock *);
+
+extern void nni_ctx_close(nni_ctx *);
+
+extern void nni_ctx_recv(nni_ctx *, nni_aio *);
+
+extern void nni_ctx_send(nni_ctx *, nni_aio *);
+
+extern void nni_ctx_send(nni_ctx *, nni_aio *);
+
+extern int nni_ctx_getopt(nni_ctx *, const char *, void *, size_t *, int);
+
+extern int nni_ctx_setopt(nni_ctx *, const char *, const void *, size_t, int);
+
 #endif // CORE_SOCKET_H

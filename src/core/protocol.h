@@ -47,11 +47,36 @@ struct nni_proto_pipe_ops {
 	void (*pipe_stop)(void *);
 };
 
+struct nni_proto_ctx_option {
+	const char *co_name;
+	int         co_type;
+	int (*co_getopt)(void *, void *, size_t *, int);
+	int (*co_setopt)(void *, const void *, size_t, int);
+};
+
+struct nni_proto_ctx_ops {
+	// ctx_init creates a new context. The second argument is the
+	// protocol specific socket structure.
+	int (*ctx_init)(void **, void *);
+
+	// ctx_fini destroys a context.
+	void (*ctx_fini)(void *);
+
+	// ctx_recv is an asynchronous recv.
+	void (*ctx_recv)(void *, nni_aio *);
+
+	// ctx_send is an asynchronous send.
+	void (*ctx_send)(void *, nni_aio *);
+
+	// ctx_options array.
+	nni_proto_ctx_option *ctx_options;
+};
+
 struct nni_proto_sock_option {
 	const char *pso_name;
 	int         pso_type;
 	int (*pso_getopt)(void *, void *, size_t *, int);
-	int (*pso_setopt)(void *, const void *, size_t);
+	int (*pso_setopt)(void *, const void *, size_t, int);
 };
 
 struct nni_proto_sock_ops {
@@ -103,6 +128,7 @@ struct nni_proto {
 	uint32_t                  proto_flags;    // Protocol flags
 	const nni_proto_sock_ops *proto_sock_ops; // Per-socket opeations
 	const nni_proto_pipe_ops *proto_pipe_ops; // Per-pipe operations.
+	const nni_proto_ctx_ops * proto_ctx_ops;  // Context operations.
 
 	// proto_init, if not NULL, provides a function that initializes
 	// global values.  The main purpose of this may be to initialize

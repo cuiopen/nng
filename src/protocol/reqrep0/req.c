@@ -28,29 +28,49 @@
 
 typedef struct req0_pipe req0_pipe;
 typedef struct req0_sock req0_sock;
+typedef struct req0_ctx  req0_ctx;
 
-static void req0_resend(req0_sock *);
-static void req0_timeout(void *);
+static void req0_run_sendq(req0_sock *);
+static void req0_ctx_reset(req0_ctx *);
+static void req0_ctx_timeout(void *);
 static void req0_pipe_fini(void *);
+
+// A req0_ctx is a "context" for the request.  It uses most of the
+// socket, but keeps track of its own outstanding replays, the request ID,
+// and so forth.
+struct req0_ctx {
+	nni_list_node  sqnode; // node on the sendq
+	nni_list_node  pnode;  // node on the pipe list
+	uint32_t       reqid;
+	req0_sock *    sock;
+	nni_aio *      aio;    // user aio waiting to receive - only one!
+	nng_msg *      reqmsg; // request message
+	nng_msg *      repmsg; // reply message
+	nni_timer_node timer;
+	nni_duration   retry;
+	bool           notify; // if true, send notifications
+};
 
 // A req0_sock is our per-socket protocol private structure.
 struct req0_sock {
 	nni_msgq *   uwq;
 	nni_msgq *   urq;
+	nni_sock *   nsock;
 	nni_duration retry;
-	nni_time     resend;
 	bool         raw;
 	bool         wantw;
 	bool         closed;
+	bool         hasctx;
 	int          ttl;
 	nni_msg *    reqmsg;
 
-	req0_pipe *pendpipe;
+	req0_ctx sctx; // base socket ctx
 
 	nni_list readypipes;
 	nni_list busypipes;
 
-	nni_timer_node timer;
+	nni_list    sendq;  // contexts waiting to send.
+	nni_idhash *ctxids; // contexts by request ID
 
 	uint32_t nextid;   // next id
 	uint8_t  reqid[4]; // outstanding request ID (big endian)
@@ -63,6 +83,7 @@ struct req0_pipe {
 	nni_pipe *    pipe;
 	req0_sock *   req;
 	nni_list_node node;
+	nni_list      ctxs;           // ctxs with pending traffic
 	nni_aio *     aio_getq;       // raw mode only
 	nni_aio *     aio_sendraw;    // raw mode only
 	nni_aio *     aio_sendcooked; // cooked mode only
@@ -81,28 +102,42 @@ static int
 req0_sock_init(void **sp, nni_sock *sock)
 {
 	req0_sock *s;
+	int        rv;
 
 	if ((s = NNI_ALLOC_STRUCT(s)) == NULL) {
 		return (NNG_ENOMEM);
 	}
+	if ((rv = nni_idhash_init(&s->ctxids)) != 0) {
+		NNI_FREE_STRUCT(s);
+		return (rv);
+	}
+
+	// Request IDs are 32 bits, with the high order bit set.
+	// We start at a random point, to minimize likelihood of
+	// accidental collision across restarts.
+	nni_idhash_set_limits(
+	    s->ctxids, 0x80000000u, 0xffffffffu, nni_random() | 0x80000000u);
+
 	nni_mtx_init(&s->mtx);
 	nni_cv_init(&s->cv, &s->mtx);
 
 	NNI_LIST_INIT(&s->readypipes, req0_pipe, node);
 	NNI_LIST_INIT(&s->busypipes, req0_pipe, node);
-	nni_timer_init(&s->timer, req0_timeout, s);
+	NNI_LIST_INIT(&s->sendq, req0_ctx, sqnode);
+	nni_timer_init(&s->sctx.timer, req0_ctx_timeout, &s->sctx);
 
 	// this is "semi random" start for request IDs.
-	s->nextid = nni_random();
-	s->retry  = NNI_SECOND * 60;
-	s->reqmsg = NULL;
-	s->raw    = false;
-	s->wantw  = false;
-	s->resend = NNI_TIME_ZERO;
-	s->ttl    = 8;
-	s->uwq    = nni_sock_sendq(sock);
-	s->urq    = nni_sock_recvq(sock);
-	*sp       = s;
+	s->nsock = sock;
+
+	s->sctx.sock   = s;
+	s->sctx.notify = true;
+	s->sctx.retry  = NNI_SECOND * 60;
+
+	s->raw = false;
+	s->ttl = 8;
+	s->uwq = nni_sock_sendq(sock);
+	s->urq = nni_sock_recvq(sock);
+	*sp    = s;
 
 	return (0);
 }
@@ -121,8 +156,7 @@ req0_sock_close(void *arg)
 	nni_mtx_lock(&s->mtx);
 	s->closed = true;
 	nni_mtx_unlock(&s->mtx);
-
-	nni_timer_cancel(&s->timer);
+	nni_timer_cancel(&s->sctx.timer);
 }
 
 static void
@@ -138,6 +172,7 @@ req0_sock_fini(void *arg)
 	if (s->reqmsg != NULL) {
 		nni_msg_free(s->reqmsg);
 	}
+	nni_idhash_fini(s->ctxids);
 	nni_mtx_unlock(&s->mtx);
 	nni_cv_fini(&s->cv);
 	nni_mtx_fini(&s->mtx);
@@ -179,6 +214,7 @@ req0_pipe_init(void **pp, nni_pipe *pipe, void *s)
 	}
 
 	NNI_LIST_NODE_INIT(&p->node);
+	NNI_LIST_INIT(&p->ctxs, req0_ctx, pnode);
 	p->pipe = pipe;
 	p->req  = s;
 	*pp     = p;
@@ -201,13 +237,12 @@ req0_pipe_start(void *arg)
 		return (NNG_ECLOSED);
 	}
 	nni_list_append(&s->readypipes, p);
-	// If sock was waiting for somewhere to send data, go ahead and
-	// send it to this pipe.
-	if (s->wantw) {
-		req0_resend(s);
-	}
+	req0_run_sendq(s);
 	nni_mtx_unlock(&s->mtx);
 
+	// Post a get on the upper write queue.  This is only used
+	// in raw mode, but it also gets closed down when the socket
+	// itself is shutdown.
 	nni_msgq_aio_get(s->uwq, p->aio_getq);
 	nni_pipe_recv(p->pipe, p->aio_recv);
 	return (0);
@@ -218,6 +253,7 @@ req0_pipe_stop(void *arg)
 {
 	req0_pipe *p = arg;
 	req0_sock *s = p->req;
+	req0_ctx * ctx;
 
 	nni_aio_stop(p->aio_getq);
 	nni_aio_stop(p->aio_putq);
@@ -238,22 +274,31 @@ req0_pipe_stop(void *arg)
 		}
 	}
 
-	if ((p == s->pendpipe) && (s->reqmsg != NULL)) {
-		// removing the pipe we sent the last request on...
-		// schedule immediate resend.
-		s->pendpipe = NULL;
-		s->resend   = NNI_TIME_ZERO;
-		s->wantw    = true;
-		req0_resend(s);
+	while ((ctx = nni_list_first(&p->ctxs)) != NULL) {
+		nni_list_remove(&p->ctxs, ctx);
+		// Reset the timer on this so it expires immediately.
+		// This is actually easier than canceling the timer and
+		// running the sendq separately.  (In particular, it avoids
+		// a potential deadlock on cancelling the timer.)
+		nni_timer_schedule(&ctx->timer, nni_clock() + 1);
 	}
 	nni_mtx_unlock(&s->mtx);
 }
 
 static int
-req0_sock_setopt_raw(void *arg, const void *buf, size_t sz)
+req0_sock_setopt_raw(void *arg, const void *buf, size_t sz, int typ)
 {
 	req0_sock *s = arg;
-	return (nni_setopt_bool(&s->raw, buf, sz));
+	int        rv;
+
+	nni_mtx_lock(&s->mtx);
+	if (s->hasctx) {
+		nni_mtx_unlock(&s->mtx);
+		return (NNG_EBUSY); // cannot set raw mode when contexts active
+	}
+	rv = nni_copyin_bool(&s->raw, buf, sz, typ);
+	nni_mtx_unlock(&s->mtx);
+	return (rv);
 }
 
 static int
@@ -264,10 +309,10 @@ req0_sock_getopt_raw(void *arg, void *buf, size_t *szp, int typ)
 }
 
 static int
-req0_sock_setopt_maxttl(void *arg, const void *buf, size_t sz)
+req0_sock_setopt_maxttl(void *arg, const void *buf, size_t sz, int typ)
 {
 	req0_sock *s = arg;
-	return (nni_setopt_int(&s->ttl, buf, sz, 1, 255));
+	return (nni_copyin_int(&s->ttl, buf, sz, 1, 255, typ));
 }
 
 static int
@@ -278,28 +323,25 @@ req0_sock_getopt_maxttl(void *arg, void *buf, size_t *szp, int typ)
 }
 
 static int
-req0_sock_setopt_resendtime(void *arg, const void *buf, size_t sz)
+req0_sock_setopt_resendtime(void *arg, const void *buf, size_t sz, int typ)
 {
 	req0_sock *s = arg;
-	return (nni_setopt_ms(&s->retry, buf, sz));
+	return (nni_copyin_ms(&s->sctx.retry, buf, sz, typ));
 }
 
 static int
 req0_sock_getopt_resendtime(void *arg, void *buf, size_t *szp, int typ)
 {
 	req0_sock *s = arg;
-	return (nni_copyout_ms(s->retry, buf, szp, typ));
+	return (nni_copyout_ms(s->sctx.retry, buf, szp, typ));
 }
 
 // Raw and cooked mode differ in the way they send messages out.
 //
-// For cooked mdes, we have a getq callback on the upper write queue, which
-// when it finds a message, cancels any current processing, and saves a copy
-// of the message, and then tries to "resend" the message, looking for a
-// suitable available outgoing pipe.  If no suitable pipe is available,
-// a flag is set, so that as soon as such a pipe is available we trigger
-// a resend attempt.  We also trigger the attempt on either timeout, or if
-// the underlying pipe we chose disconnects.
+// For cooked mode, we use a context, and send out that way.  This
+// completely bypasses the upper write queue.  Each context keeps one
+// message pending; these are "scheduled" via the sendq.  The sendq
+// is ordered, so FIFO ordering between contexts is provided for.
 //
 // For raw mode we can just let the pipes "contend" via getq to get a
 // message from the upper write queue.  The msgqueue implementation
@@ -354,8 +396,6 @@ req0_sendcooked_cb(void *arg)
 
 	if (nni_aio_result(p->aio_sendcooked) != 0) {
 		// We failed to send... clean up and deal with it.
-		// We leave ourselves on the busy list for now, which
-		// means no new asynchronous traffic can occur here.
 		nni_msg_free(nni_aio_get_msg(p->aio_sendcooked));
 		nni_aio_set_msg(p->aio_sendcooked, NULL);
 		nni_pipe_stop(p->pipe);
@@ -363,14 +403,13 @@ req0_sendcooked_cb(void *arg)
 	}
 
 	// Cooked mode.  We completed a cooked send, so we need to
-	// reinsert ourselves in the ready list, and possibly schedule
-	// a resend.
+	// reinsert ourselves in the ready list, and re-run the sendq.
 
 	nni_mtx_lock(&s->mtx);
 	if (nni_list_active(&s->busypipes, p)) {
 		nni_list_remove(&s->busypipes, p);
 		nni_list_append(&s->readypipes, p);
-		req0_resend(s);
+		req0_run_sendq(s);
 	} else {
 		// We wind up here if stop was called from the reader
 		// side while we were waiting to be scheduled to run for the
@@ -400,8 +439,12 @@ req0_putq_cb(void *arg)
 static void
 req0_recv_cb(void *arg)
 {
-	req0_pipe *p = arg;
+	req0_pipe *p    = arg;
+	req0_sock *sock = p->req;
+	req0_ctx * ctx;
 	nni_msg *  msg;
+	nni_aio *  aio;
+	uint32_t   id;
 
 	if (nni_aio_result(p->aio_recv) != 0) {
 		nni_pipe_stop(p->pipe);
@@ -412,22 +455,64 @@ req0_recv_cb(void *arg)
 	nni_aio_set_msg(p->aio_recv, NULL);
 	nni_msg_set_pipe(msg, nni_pipe_id(p->pipe));
 
-	// We yank 4 bytes of body, and move them to the header.
+	// We yank 4 bytes from front of body, and move them to the header.
 	if (nni_msg_len(msg) < 4) {
 		// Malformed message.
 		goto malformed;
 	}
-	if (nni_msg_header_append(msg, nni_msg_body(msg), 4) != 0) {
+	id = nni_msg_trim_u32(msg);
+	if (nni_msg_header_append_u32(msg, id) != 0) {
 		// Arguably we could just discard and carry on.  But
 		// dropping the connection is probably more helpful since
 		// it lets the other side see that a problem occurred.
 		// Plus it gives us a chance to reclaim some memory.
 		goto malformed;
 	}
-	(void) nni_msg_trim(msg, 4); // Cannot fail
 
-	nni_aio_set_msg(p->aio_putq, msg);
-	nni_msgq_aio_put(p->req->urq, p->aio_putq);
+	nni_mtx_lock(&sock->mtx);
+	if (sock->raw) {
+		nni_mtx_unlock(&sock->mtx);
+		nni_aio_set_msg(p->aio_putq, msg);
+		nni_msgq_aio_put(sock->urq, p->aio_putq);
+		return;
+	}
+
+	// Cooked mode.
+
+	// Schedule another receive while we are processing this.
+	nni_pipe_recv(p->pipe, p->aio_recv);
+
+	// Look for a context to receive it.
+	if ((nni_idhash_find(sock->ctxids, id, (void **) &ctx) != 0) ||
+	    (ctx->repmsg != NULL)) {
+		nni_mtx_unlock(&sock->mtx);
+		// No waiting context, or context already has a message.
+		// Discard the message.
+		nni_msg_free(msg);
+		return;
+	}
+
+	// We have our match, so we can remove this.
+	nni_idhash_remove(sock->ctxids, id);
+	ctx->reqid = 0;
+	if (ctx->reqmsg != NULL) {
+		nni_msg_free(ctx->reqmsg);
+		ctx->reqmsg = NULL;
+	}
+
+	// Is there an aio waiting for us?
+	if ((aio = ctx->aio) != NULL) {
+		ctx->aio = NULL;
+		nni_aio_set_msg(aio, msg);
+		nni_aio_finish(aio, 0, nni_msg_len(msg));
+	} else {
+		// No AIO, so stash msg.  Receive will pick it up later.
+		ctx->repmsg = msg;
+		if (ctx->notify) {
+			nni_sock_set_recvable(sock->nsock, true);
+		}
+	}
+	nni_mtx_unlock(&sock->mtx);
 	return;
 
 malformed:
@@ -436,81 +521,273 @@ malformed:
 }
 
 static void
-req0_timeout(void *arg)
+req0_ctx_timeout(void *arg)
 {
-	req0_sock *s = arg;
+	req0_ctx * ctx  = arg;
+	req0_sock *sock = ctx->sock;
 
-	nni_mtx_lock(&s->mtx);
-	if (s->reqmsg != NULL) {
-		s->wantw = true;
-		req0_resend(s);
+	nni_mtx_lock(&sock->mtx);
+	if ((ctx->reqmsg != NULL) && (!sock->closed)) {
+		if (!nni_list_node_active(&ctx->sqnode)) {
+			nni_list_append(&sock->sendq, ctx);
+		}
+		req0_run_sendq(sock);
 	}
-	nni_mtx_unlock(&s->mtx);
+	nni_mtx_unlock(&sock->mtx);
+}
+
+static int
+req0_ctx_init(void **cpp, void *sarg)
+{
+	req0_sock *sock = sarg;
+	req0_ctx * ctx;
+
+	if ((ctx = NNI_ALLOC_STRUCT(ctx)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+
+	nni_timer_init(&ctx->timer, req0_ctx_timeout, ctx);
+
+	nni_mtx_lock(&sock->mtx);
+	sock->hasctx = true;
+	ctx->sock    = sock;
+	ctx->retry   = sock->retry;
+	ctx->notify  = false;
+	nni_mtx_unlock(&sock->mtx);
+
+	*cpp = ctx;
+	return (0);
 }
 
 static void
-req0_resend(req0_sock *s)
+req0_ctx_fini(void *arg)
 {
-	req0_pipe *p;
-	nni_msg *  msg;
+	req0_ctx * ctx  = arg;
+	req0_sock *sock = ctx->sock;
+
+	nni_mtx_lock(&sock->mtx);
+	req0_ctx_reset(ctx);
+	nni_mtx_unlock(&sock->mtx);
+
+	nni_timer_fini(&ctx->timer);
+
+	NNI_FREE_STRUCT(ctx);
+}
+
+static int
+req0_ctx_setopt_resendtime(void *arg, const void *buf, size_t sz, int typ)
+{
+	req0_ctx *ctx = arg;
+	return (nni_copyin_ms(&ctx->retry, buf, sz, typ));
+}
+
+static int
+req0_ctx_getopt_resendtime(void *arg, void *buf, size_t *szp, int typ)
+{
+	req0_ctx *ctx = arg;
+	return (nni_copyout_ms(ctx->retry, buf, szp, typ));
+}
+
+static void
+req0_run_sendq(req0_sock *s)
+{
+	req0_ctx *ctx;
 
 	// Note: This routine should be called with the socket lock held.
 	// Also, this should only be called while handling cooked mode
 	// requests.
-	if ((msg = s->reqmsg) == NULL) {
+	if (nni_list_empty(&s->sendq)) {
 		return;
 	}
 
-	if (s->closed) {
-		s->reqmsg = NULL;
-		nni_msg_free(msg);
-	}
+	while ((ctx = nni_list_first(&s->sendq)) != NULL) {
+		nni_msg *  msg;
+		req0_pipe *p;
 
-	if (s->wantw) {
-		s->wantw = false;
-
-		if (nni_msg_dup(&msg, s->reqmsg) != 0) {
-			// Failed to alloc message, reschedule it. Also,
-			// mark that we have a message we want to resend,
-			// in case something comes available.
-			s->wantw = true;
-			nni_timer_schedule(&s->timer, nni_clock() + s->retry);
-			return;
-		}
-
-		// Now we iterate across all possible outpipes, until
-		// one accepts it.
 		if ((p = nni_list_first(&s->readypipes)) == NULL) {
-			// No pipes ready to process us.  Note that we have
-			// something to send, and schedule it.
-			nni_msg_free(msg);
-			s->wantw = true;
 			return;
 		}
+
+		// We have a place to send it, so go ahead do the send.
+		// If a sending error occurs that causes the message to
+		// be dropped, we rely on the resend timer to pick it up.
+		nni_list_remove(&s->sendq, ctx);
+
+		// Schedule a resubmit timer.  We only do this if we got
+		// a pipe to send to.  Otherwise, we should get handled
+		// the next time that the sendq is run.
+		nni_timer_schedule(&ctx->timer, nni_clock() + ctx->retry);
+
+		if (nni_msg_dup(&msg, ctx->reqmsg) != 0) {
+			// Oops.  Well, keep trying each context; maybe
+			// one of them will get lucky.
+			continue;
+		}
+
+		// Put us on the pipe list of active contexts.
+		// This gives the pipe a chance to kick a resubmit
+		// if the pipe is removed.
+		nni_list_node_remove(&ctx->pnode);
+		nni_list_append(&p->ctxs, ctx);
 
 		nni_list_remove(&s->readypipes, p);
 		nni_list_append(&s->busypipes, p);
-
-		s->pendpipe = p;
-		s->resend   = nni_clock() + s->retry;
 		nni_aio_set_msg(p->aio_sendcooked, msg);
-
-		// Note that because we were ready rather than busy, we
-		// should not have any I/O oustanding and hence the aio
-		// object will be available for our use.
 		nni_pipe_send(p->pipe, p->aio_sendcooked);
-		nni_timer_schedule(&s->timer, s->resend);
 	}
+}
+
+void
+req0_ctx_reset(req0_ctx *ctx)
+{
+	req0_sock *sock = ctx->sock;
+	// Call with sock lock held!
+	nni_timer_cancel(&ctx->timer);
+	nni_list_node_remove(&ctx->pnode);
+	nni_list_node_remove(&ctx->sqnode);
+	if (ctx->reqid != 0) {
+		nni_idhash_remove(sock->ctxids, ctx->reqid);
+		ctx->reqid = 0;
+	}
+	if (ctx->reqmsg != NULL) {
+		nni_msg_free(ctx->reqmsg);
+		ctx->reqmsg = NULL;
+	}
+	if (ctx->repmsg != NULL) {
+		nni_msg_free(ctx->repmsg);
+		ctx->repmsg = NULL;
+	}
+}
+
+static void
+req0_ctx_cancel(nni_aio *aio, int rv)
+{
+	req0_ctx * ctx  = nni_aio_get_prov_data(aio);
+	req0_sock *sock = ctx->sock;
+
+	nni_mtx_lock(&sock->mtx);
+	if (ctx->aio != aio) {
+		// already completed, ignore this.
+		nni_mtx_unlock(&sock->mtx);
+		return;
+	}
+	ctx->aio = NULL;
+
+	// Cancellation of a pending receive is treated as aborting the
+	// entire state machine.  This allows us to preserve the semantic of
+	// exactly one receive operation per send operation, and should
+	// be the least surprising for users.  The main consequence is that
+	// if a receive operation is completed (in error or otherwise), the
+	// user must submit a new send operation to restart the state machine.
+	req0_ctx_reset(ctx);
+
+	nni_aio_finish_error(aio, rv);
+	nni_mtx_unlock(&sock->mtx);
+}
+
+static void
+req0_ctx_recv_locked(req0_ctx *ctx, nni_aio *aio)
+{
+	nni_msg *msg;
+
+	if (nni_aio_start(aio, req0_ctx_cancel, ctx) != 0) {
+		return;
+	}
+	if ((ctx->aio != NULL) ||
+	    ((ctx->reqmsg == NULL) && (ctx->repmsg == NULL))) {
+		// We have already got a pending cooked receive, or
+		// we have not tried to send a request yet.  Either of
+		// these violate our basic state assumptions.
+		nni_aio_finish_error(aio, NNG_ESTATE);
+		return;
+	}
+
+	if ((msg = ctx->repmsg) != NULL) {
+		ctx->repmsg = NULL;
+
+		// We have got a message to pass up, yay!
+
+		nni_aio_set_msg(aio, msg);
+		nni_aio_finish(aio, 0, nni_msg_len(msg));
+		ctx->repmsg = NULL;
+	} else {
+		// No message yet, so post the wait.
+		ctx->aio = aio;
+	}
+}
+
+static void
+req0_ctx_recv(void *arg, nni_aio *aio)
+{
+	req0_ctx * ctx  = arg;
+	req0_sock *sock = ctx->sock;
+
+	nni_mtx_lock(&sock->mtx);
+	req0_ctx_recv_locked(ctx, aio);
+	nni_mtx_unlock(&sock->mtx);
+}
+
+static void
+req0_ctx_send_locked(req0_ctx *ctx, nni_aio *aio)
+{
+	req0_sock *sock = ctx->sock;
+	nng_msg *  msg  = nni_aio_get_msg(aio);
+	uint64_t   id;
+	int        rv;
+
+	// Sending a new requst cancels the old one, including any
+	// outstanding reply.
+	if (ctx->aio != NULL) {
+		nni_aio_finish_error(ctx->aio, NNG_ECANCELED);
+		ctx->aio = NULL;
+	}
+
+	// This resets the entire state machine.
+	req0_ctx_reset(ctx);
+
+	// Insert us on the per ID hash list, so that receives can find us.
+	if ((rv = nni_idhash_alloc(sock->ctxids, &id, ctx)) != 0) {
+		nni_aio_finish_error(aio, rv);
+		return;
+	}
+	ctx->reqid  = (uint32_t) id;
+	ctx->reqmsg = msg;
+	if ((rv = nni_msg_header_append_u32(msg, ctx->reqid)) != 0) {
+		nni_idhash_remove(sock->ctxids, id);
+		nni_aio_finish_error(aio, rv);
+		return;
+	}
+
+	// Stick us on the sendq list.
+	nni_list_append(&sock->sendq, ctx);
+
+	// We are adding to the sendq, so run it.
+	req0_run_sendq(sock);
+
+	nni_aio_finish(aio, 0, nni_msg_len(msg));
+
+	if (ctx->notify) {
+		// We are *always* sendable, because subsequent sends
+		// merely cancel prior sends.
+		nni_sock_set_sendable(sock->nsock, true);
+	}
+}
+
+static void
+req0_ctx_send(void *arg, nni_aio *aio)
+{
+	req0_ctx * ctx  = arg;
+	req0_sock *sock = ctx->sock;
+
+	nni_mtx_lock(&sock->mtx);
+	req0_ctx_send_locked(ctx, aio);
+	nni_mtx_unlock(&sock->mtx);
 }
 
 static void
 req0_sock_send(void *arg, nni_aio *aio)
 {
 	req0_sock *s = arg;
-	uint32_t   id;
-	size_t     len;
-	nni_msg *  msg;
-	int        rv;
 
 	nni_mtx_lock(&s->mtx);
 	if (s->raw) {
@@ -519,87 +796,8 @@ req0_sock_send(void *arg, nni_aio *aio)
 		return;
 	}
 
-	msg = nni_aio_get_msg(aio);
-	len = nni_msg_len(msg);
-
-	// In cooked mode, because we need to manage our own resend logic,
-	// we bypass the upper writeq entirely.
-
-	// Generate a new request ID.  We always set the high
-	// order bit so that the peer can locate the end of the
-	// backtrace.  (Pipe IDs have the high order bit clear.)
-	id = (s->nextid++) | 0x80000000u;
-	// Request ID is in big endian format.
-	NNI_PUT32(s->reqid, id);
-
-	if ((rv = nni_msg_header_append(msg, s->reqid, 4)) != 0) {
-		nni_mtx_unlock(&s->mtx);
-		nni_aio_finish_error(aio, rv);
-		return;
-	}
-
-	// If another message is there, this cancels it.
-	if (s->reqmsg != NULL) {
-		nni_msg_free(s->reqmsg);
-		s->reqmsg = NULL;
-	}
-
-	nni_aio_set_msg(aio, NULL);
-
-	// Make a duplicate message... for retries.
-	s->reqmsg = msg;
-	// Schedule for immediate send
-	s->resend = NNI_TIME_ZERO;
-	s->wantw  = true;
-
-	req0_resend(s);
-
+	req0_ctx_send_locked(&s->sctx, aio);
 	nni_mtx_unlock(&s->mtx);
-
-	nni_aio_finish(aio, 0, len);
-}
-
-static nni_msg *
-req0_sock_filter(void *arg, nni_msg *msg)
-{
-	req0_sock *s = arg;
-	nni_msg *  rmsg;
-
-	nni_mtx_lock(&s->mtx);
-	if (s->raw) {
-		// Pass it unmolested
-		nni_mtx_unlock(&s->mtx);
-		return (msg);
-	}
-
-	if (nni_msg_header_len(msg) < 4) {
-		nni_mtx_unlock(&s->mtx);
-		nni_msg_free(msg);
-		return (NULL);
-	}
-
-	if ((rmsg = s->reqmsg) == NULL) {
-		// We had no outstanding request.  (Perhaps canceled,
-		// or duplicate response.)
-		nni_mtx_unlock(&s->mtx);
-		nni_msg_free(msg);
-		return (NULL);
-	}
-
-	if (memcmp(nni_msg_header(msg), s->reqid, 4) != 0) {
-		// Wrong request id.
-		nni_mtx_unlock(&s->mtx);
-		nni_msg_free(msg);
-		return (NULL);
-	}
-
-	s->reqmsg   = NULL;
-	s->pendpipe = NULL;
-	nni_mtx_unlock(&s->mtx);
-
-	nni_msg_free(rmsg);
-
-	return (msg);
 }
 
 static void
@@ -608,15 +806,13 @@ req0_sock_recv(void *arg, nni_aio *aio)
 	req0_sock *s = arg;
 
 	nni_mtx_lock(&s->mtx);
-	if (!s->raw) {
-		if (s->reqmsg == NULL) {
-			nni_mtx_unlock(&s->mtx);
-			nni_aio_finish_error(aio, NNG_ESTATE);
-			return;
-		}
+	if (s->raw) {
+		nni_mtx_unlock(&s->mtx);
+		nni_msgq_aio_get(s->urq, aio);
+		return;
 	}
+	req0_ctx_recv_locked(&s->sctx, aio);
 	nni_mtx_unlock(&s->mtx);
-	nni_msgq_aio_get(s->urq, aio);
 }
 
 static nni_proto_pipe_ops req0_pipe_ops = {
@@ -624,6 +820,26 @@ static nni_proto_pipe_ops req0_pipe_ops = {
 	.pipe_fini  = req0_pipe_fini,
 	.pipe_start = req0_pipe_start,
 	.pipe_stop  = req0_pipe_stop,
+};
+
+static nni_proto_ctx_option req0_ctx_options[] = {
+	{
+	    .co_name   = NNG_OPT_REQ_RESENDTIME,
+	    .co_type   = NNI_TYPE_DURATION,
+	    .co_getopt = req0_ctx_getopt_resendtime,
+	    .co_setopt = req0_ctx_setopt_resendtime,
+	},
+	{
+	    .co_name = NULL,
+	},
+};
+
+static nni_proto_ctx_ops req0_ctx_ops = {
+	.ctx_init    = req0_ctx_init,
+	.ctx_fini    = req0_ctx_fini,
+	.ctx_recv    = req0_ctx_recv,
+	.ctx_send    = req0_ctx_send,
+	.ctx_options = req0_ctx_options,
 };
 
 static nni_proto_sock_option req0_sock_options[] = {
@@ -657,7 +873,6 @@ static nni_proto_sock_ops req0_sock_ops = {
 	.sock_open    = req0_sock_open,
 	.sock_close   = req0_sock_close,
 	.sock_options = req0_sock_options,
-	.sock_filter  = req0_sock_filter,
 	.sock_send    = req0_sock_send,
 	.sock_recv    = req0_sock_recv,
 };
@@ -669,6 +884,7 @@ static nni_proto req0_proto = {
 	.proto_flags    = NNI_PROTO_FLAG_SNDRCV,
 	.proto_sock_ops = &req0_sock_ops,
 	.proto_pipe_ops = &req0_pipe_ops,
+	.proto_ctx_ops  = &req0_ctx_ops,
 };
 
 int
