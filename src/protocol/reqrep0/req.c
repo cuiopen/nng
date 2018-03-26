@@ -39,6 +39,7 @@ static void req0_pipe_fini(void *);
 // socket, but keeps track of its own outstanding replays, the request ID,
 // and so forth.
 struct req0_ctx {
+	nni_list_node  snode;
 	nni_list_node  sqnode; // node on the sendq
 	nni_list_node  pnode;  // node on the pipe list
 	uint32_t       reqid;
@@ -68,6 +69,7 @@ struct req0_sock {
 
 	nni_list readypipes;
 	nni_list busypipes;
+	nni_list ctxs;
 
 	nni_list    sendq;  // contexts waiting to send.
 	nni_idhash *ctxids; // contexts by request ID
@@ -124,14 +126,16 @@ req0_sock_init(void **sp, nni_sock *sock)
 	NNI_LIST_INIT(&s->readypipes, req0_pipe, node);
 	NNI_LIST_INIT(&s->busypipes, req0_pipe, node);
 	NNI_LIST_INIT(&s->sendq, req0_ctx, sqnode);
-	nni_timer_init(&s->sctx.timer, req0_ctx_timeout, &s->sctx);
+	NNI_LIST_INIT(&s->ctxs, req0_ctx, snode);
 
 	// this is "semi random" start for request IDs.
 	s->nsock = sock;
 
+	nni_timer_init(&s->sctx.timer, req0_ctx_timeout, &s->sctx);
 	s->sctx.sock   = s;
 	s->sctx.notify = true;
 	s->sctx.retry  = NNI_SECOND * 60;
+	nni_list_append(&s->ctxs, &s->sctx);
 
 	s->raw = false;
 	s->ttl = 8;
@@ -152,9 +156,17 @@ static void
 req0_sock_close(void *arg)
 {
 	req0_sock *s = arg;
+	req0_ctx * ctx;
 
 	nni_mtx_lock(&s->mtx);
 	s->closed = true;
+	NNI_LIST_FOREACH (&s->ctxs, ctx) {
+		if (ctx->aio != NULL) {
+			nni_aio_finish_error(ctx->aio, NNG_ECLOSED);
+			ctx->aio = NULL;
+			req0_ctx_reset(ctx);
+		}
+	}
 	nni_mtx_unlock(&s->mtx);
 	nni_timer_cancel(&s->sctx.timer);
 }
@@ -173,6 +185,7 @@ req0_sock_fini(void *arg)
 		nni_msg_free(s->reqmsg);
 	}
 	nni_idhash_fini(s->ctxids);
+	nni_timer_fini(&s->sctx.timer);
 	nni_mtx_unlock(&s->mtx);
 	nni_cv_fini(&s->cv);
 	nni_mtx_fini(&s->mtx);
@@ -280,7 +293,7 @@ req0_pipe_stop(void *arg)
 		// This is actually easier than canceling the timer and
 		// running the sendq separately.  (In particular, it avoids
 		// a potential deadlock on cancelling the timer.)
-		nni_timer_schedule(&ctx->timer, nni_clock() + 1);
+		nni_timer_schedule(&ctx->timer, NNI_TIME_ZERO);
 	}
 	nni_mtx_unlock(&s->mtx);
 }
@@ -569,6 +582,7 @@ req0_ctx_fini(void *arg)
 	req0_ctx_reset(ctx);
 	nni_mtx_unlock(&sock->mtx);
 
+	nni_timer_cancel(&ctx->timer);
 	nni_timer_fini(&ctx->timer);
 
 	NNI_FREE_STRUCT(ctx);
@@ -642,7 +656,17 @@ req0_ctx_reset(req0_ctx *ctx)
 {
 	req0_sock *sock = ctx->sock;
 	// Call with sock lock held!
-	nni_timer_cancel(&ctx->timer);
+
+	// We cannot safely "wait" using nni_timer_cancel, but this removes
+	// any scheduled timer activation.  If the timeout is already running
+	// concurrently, it will still run.  It should do nothing, because
+	// we toss the reqmsg.  There is still a very narrow race if the
+	// timeout fires, but doesn't actually start running before we
+	// both finish this function, *and* manage to reschedule another
+	// request.  The consequence of that occurring is that the request
+	// will be emitted on the wire twice.  This is not actually tragic.
+	nni_timer_schedule(&ctx->timer, NNI_TIME_NEVER);
+
 	nni_list_node_remove(&ctx->pnode);
 	nni_list_node_remove(&ctx->sqnode);
 	if (ctx->reqid != 0) {

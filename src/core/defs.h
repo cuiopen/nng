@@ -29,9 +29,6 @@
 // Returns the size of an array in elements. (Convenience.)
 #define NNI_NUM_ELEMENTS(x) ((unsigned) (sizeof(x) / sizeof((x)[0])))
 
-// XXX: Public name to be exposed later.
-typedef struct nng_ctx nng_ctx;
-
 // These types are common but have names shared with user space.
 // Internal code should use these names when possible.
 typedef nng_msg           nni_msg;
@@ -39,12 +36,12 @@ typedef nng_sockaddr      nni_sockaddr;
 typedef nng_url           nni_url;
 typedef nng_iov           nni_iov;
 typedef nng_aio           nni_aio;
-typedef nng_ctx           nni_ctx;
 typedef struct nng_event  nni_event;
 typedef struct nng_notify nni_notify;
 
 // These are our own names.
 typedef struct nni_socket           nni_sock;
+typedef struct nni_ctx              nni_ctx;
 typedef struct nni_ep               nni_ep;
 typedef struct nni_pipe             nni_pipe;
 typedef struct nni_tran             nni_tran;

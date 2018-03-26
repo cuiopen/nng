@@ -112,6 +112,12 @@ struct nni_proto_sock_ops {
 	// should return NULL, otherwise the message (possibly modified).
 	nni_msg *(*sock_filter)(void *, nni_msg *);
 
+	// Socket draining is intended to permit protocols to "drain"
+	// before exiting.  For protocols where draining makes no
+	// sense, this may be NULL.  (Example: REQ and SURVEYOR should
+	// not drain, because they cannot receive a reply!)
+	void (*sock_drain)(void *, nni_aio *);
+
 	// Options. Must not be NULL. Final entry should have NULL name.
 	nni_proto_sock_option *sock_options;
 };
