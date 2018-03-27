@@ -101,7 +101,7 @@ static void req0_recv_cb(void *);
 static void req0_putq_cb(void *);
 
 static int
-req0_sock_init(void **sp, nni_sock *sock)
+req0_sock_init_impl(void **sp, nni_sock *sock, bool raw)
 {
 	req0_sock *s;
 	int        rv;
@@ -137,13 +137,25 @@ req0_sock_init(void **sp, nni_sock *sock)
 	s->sctx.retry  = NNI_SECOND * 60;
 	nni_list_append(&s->ctxs, &s->sctx);
 
-	s->raw = false;
+	s->raw = raw;
 	s->ttl = 8;
 	s->uwq = nni_sock_sendq(sock);
 	s->urq = nni_sock_recvq(sock);
 	*sp    = s;
 
 	return (0);
+}
+
+static int
+req0_sock_init(void **sp, nni_sock *sock)
+{
+	return (req0_sock_init_impl(sp, sock, false));
+}
+
+static int
+req0_sock_init_raw(void **sp, nni_sock *sock)
+{
+	return (req0_sock_init_impl(sp, sock, true));
 }
 
 static void
@@ -296,29 +308,6 @@ req0_pipe_stop(void *arg)
 		nni_timer_schedule(&ctx->timer, NNI_TIME_ZERO);
 	}
 	nni_mtx_unlock(&s->mtx);
-}
-
-static int
-req0_sock_setopt_raw(void *arg, const void *buf, size_t sz, int typ)
-{
-	req0_sock *s = arg;
-	int        rv;
-
-	nni_mtx_lock(&s->mtx);
-	if (s->hasctx) {
-		nni_mtx_unlock(&s->mtx);
-		return (NNG_EBUSY); // cannot set raw mode when contexts active
-	}
-	rv = nni_copyin_bool(&s->raw, buf, sz, typ);
-	nni_mtx_unlock(&s->mtx);
-	return (rv);
-}
-
-static int
-req0_sock_getopt_raw(void *arg, void *buf, size_t *szp, int typ)
-{
-	req0_sock *s = arg;
-	return (nni_copyout_bool(s->raw, buf, szp, typ));
 }
 
 static int
@@ -733,7 +722,9 @@ req0_ctx_recv_locked(req0_ctx *ctx, nni_aio *aio)
 
 		nni_aio_set_msg(aio, msg);
 		nni_aio_finish(aio, 0, nni_msg_len(msg));
-		ctx->repmsg = NULL;
+		if (ctx->notify) {
+			nni_sock_set_recvable(ctx->sock->nsock, false);
+		}
 	} else {
 		// No message yet, so post the wait.
 		ctx->aio = aio;
@@ -814,14 +805,16 @@ req0_sock_send(void *arg, nni_aio *aio)
 	req0_sock *s = arg;
 
 	nni_mtx_lock(&s->mtx);
-	if (s->raw) {
-		nni_mtx_unlock(&s->mtx);
-		nni_msgq_aio_put(s->uwq, aio);
-		return;
-	}
-
 	req0_ctx_send_locked(&s->sctx, aio);
 	nni_mtx_unlock(&s->mtx);
+}
+
+static void
+req0_sock_send_raw(void *arg, nni_aio *aio)
+{
+	req0_sock *s = arg;
+
+	nni_msgq_aio_put(s->uwq, aio);
 }
 
 static void
@@ -830,13 +823,16 @@ req0_sock_recv(void *arg, nni_aio *aio)
 	req0_sock *s = arg;
 
 	nni_mtx_lock(&s->mtx);
-	if (s->raw) {
-		nni_mtx_unlock(&s->mtx);
-		nni_msgq_aio_get(s->urq, aio);
-		return;
-	}
 	req0_ctx_recv_locked(&s->sctx, aio);
 	nni_mtx_unlock(&s->mtx);
+}
+
+static void
+req0_sock_recv_raw(void *arg, nni_aio *aio)
+{
+	req0_sock *s = arg;
+
+	nni_msgq_aio_get(s->urq, aio);
 }
 
 static nni_proto_pipe_ops req0_pipe_ops = {
@@ -867,12 +863,6 @@ static nni_proto_ctx_ops req0_ctx_ops = {
 };
 
 static nni_proto_sock_option req0_sock_options[] = {
-	{
-	    .pso_name   = NNG_OPT_RAW,
-	    .pso_type   = NNI_TYPE_BOOL,
-	    .pso_getopt = req0_sock_getopt_raw,
-	    .pso_setopt = req0_sock_setopt_raw,
-	},
 	{
 	    .pso_name   = NNG_OPT_MAXTTL,
 	    .pso_type   = NNI_TYPE_INT32,
@@ -905,7 +895,7 @@ static nni_proto req0_proto = {
 	.proto_version  = NNI_PROTOCOL_VERSION,
 	.proto_self     = { NNI_PROTO_REQ_V0, "req" },
 	.proto_peer     = { NNI_PROTO_REP_V0, "rep" },
-	.proto_flags    = NNI_PROTO_FLAG_SNDRCV,
+	.proto_flags    = NNI_PROTO_FLAG_SNDRCV | NNI_PROTO_FLAG_NOMSGQ,
 	.proto_sock_ops = &req0_sock_ops,
 	.proto_pipe_ops = &req0_pipe_ops,
 	.proto_ctx_ops  = &req0_ctx_ops,
@@ -915,4 +905,30 @@ int
 nng_req0_open(nng_socket *sidp)
 {
 	return (nni_proto_open(sidp, &req0_proto));
+}
+
+static nni_proto_sock_ops req0_sock_ops_raw = {
+	.sock_init    = req0_sock_init_raw,
+	.sock_fini    = req0_sock_fini,
+	.sock_open    = req0_sock_open,
+	.sock_close   = req0_sock_close,
+	.sock_options = req0_sock_options,
+	.sock_send    = req0_sock_send_raw,
+	.sock_recv    = req0_sock_recv_raw,
+};
+
+static nni_proto req0_proto_raw = {
+	.proto_version  = NNI_PROTOCOL_VERSION,
+	.proto_self     = { NNI_PROTO_REQ_V0, "req" },
+	.proto_peer     = { NNI_PROTO_REP_V0, "rep" },
+	.proto_flags    = NNI_PROTO_FLAG_SNDRCV | NNI_PROTO_FLAG_RAW,
+	.proto_sock_ops = &req0_sock_ops_raw,
+	.proto_pipe_ops = &req0_pipe_ops,
+	.proto_ctx_ops  = NULL, // raw mode does not support contexts
+};
+
+int
+nng_req0_open_raw(nng_socket *sidp)
+{
+	return (nni_proto_open(sidp, &req0_proto_raw));
 }

@@ -208,6 +208,13 @@ nni_sock_getopt_recvfd(nni_sock *s, void *buf, size_t *szp, int typ)
 }
 
 static int
+nni_sock_getopt_raw(nni_sock *s, void *buf, size_t *szp, int typ)
+{
+	bool raw = nni_sock_flags(s) & NNI_PROTO_FLAG_RAW ? true : false;
+	return (nni_copyout_bool(raw, buf, szp, typ));
+}
+
+static int
 nni_sock_setopt_recvtimeo(nni_sock *s, const void *buf, size_t sz, int typ)
 {
 	return (nni_copyin_ms(&s->s_rcvtimeo, buf, sz, typ));
@@ -361,6 +368,12 @@ static const nni_socket_option nni_sock_options[] = {
 	    .so_type   = NNI_TYPE_STRING,
 	    .so_getopt = nni_sock_getopt_sockname,
 	    .so_setopt = nni_sock_setopt_sockname,
+	},
+	{
+	    .so_name   = NNG_OPT_RAW,
+	    .so_type   = NNI_TYPE_BOOL,
+	    .so_getopt = nni_sock_getopt_raw,
+	    .so_setopt = NULL,
 	},
 	// terminate list
 	{
@@ -719,8 +732,13 @@ nni_sock_shutdown(nni_sock *sock)
 	// We drain the upper write queue.  This is just like closing it,
 	// except that the protocol gets a chance to get the messages and
 	// push them down to the transport.  This operation can *block*
-	// until the linger time has expired.
-	nni_msgq_drain(sock->s_uwq, linger);
+	// until the linger time has expired.  We only do this for sendable
+	// sockets that are actually using the message queue of course.
+	if ((nni_sock_flags(sock) &
+	        (NNI_PROTO_FLAG_NOMSGQ | NNI_PROTO_FLAG_SND)) ==
+	    NNI_PROTO_FLAG_SND) {
+		nni_msgq_drain(sock->s_uwq, linger);
+	}
 
 	// Generally, unless the protocol is blocked trying to perform
 	// writes (e.g. a slow reader on the other side), it should be
@@ -952,7 +970,8 @@ nni_sock_setopt(nni_sock *s, const char *name, const void *v, size_t sz, int t)
 		return (NNG_ECLOSED);
 	}
 
-	// Protocol options.
+	// Protocol options.  The protocol can override options that
+	// the socket framework would otherwise supply, like buffer sizes.
 	for (pso = s->s_sock_ops.sock_options; pso->pso_name != NULL; pso++) {
 		if (strcmp(pso->pso_name, name) != 0) {
 			continue;
@@ -1108,7 +1127,8 @@ nni_sock_getopt(nni_sock *s, const char *name, void *val, size_t *szp, int t)
 		return (NNG_ECLOSED);
 	}
 
-	// Protocol specific options.
+	// Protocol specific options.  The protocol can override
+	// options like the send buffer or raw mode this way.
 	for (pso = s->s_sock_ops.sock_options; pso->pso_name != NULL; pso++) {
 		if (strcmp(name, pso->pso_name) != 0) {
 			continue;

@@ -159,10 +159,17 @@ struct nni_proto {
 
 // These flags determine which operations make sense.  We use them so that
 // we can reject attempts to create notification fds for operations that make
-// no sense.
+// no sense.  Also, we can detect raw mode, thereby providing handling for
+// that at the socket layer (NNG_PROTO_FLAG_RAW).  Finally, we provide the
+// NNI_PROTO_FLAG_NOMSGQ flag for protocols that do not use the upper write
+// or upper read queues.  In this case, the protocol is responsible for
+// sending notification about socket readiness using nni_sock_set_sendable
+// and nni_sock_set_recvable.
 #define NNI_PROTO_FLAG_RCV 1    // Protocol can receive
 #define NNI_PROTO_FLAG_SND 2    // Protocol can send
 #define NNI_PROTO_FLAG_SNDRCV 3 // Protocol can both send & recv
+#define NNI_PROTO_FLAG_RAW 4    // Protocol is raw
+#define NNI_PROTO_FLAG_NOMSGQ 8 // Protocol bypasses the upper queues
 
 // nni_proto_open is called by the protocol to create a socket instance
 // with its ops vector.  The intent is that applications will only see
