@@ -162,6 +162,7 @@ add_nng_proto_test(bus 5 NNG_PROTO_BUS0 NNG_PROTO_BUS0)
 add_nng_test(pipeline 5 NNG_PROTO_PULL0 NNG_PROTO_PIPELINE0)
 add_nng_proto_test(pair1 5 NNG_PROTO_PAIR1 NNG_PROTO_PAIR1)
 add_nng_proto_test(pubsub 5 NNG_PROTO_PUB0 NNG_PROTO_SUB0)
+add_nng_proto_test(reqctx 5 NNG_PROTO_REQ0 NNG_PROTO_REP0)
 add_nng_proto_test(reqrep 5 NNG_PROTO_REQ0 NNG_PROTO_REP0)
 add_nng_test(survey 5 NNG_PROTO_SURVEYOR0 NNG_PROTO_RESPONDENT0)
 

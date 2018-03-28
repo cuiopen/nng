@@ -63,7 +63,6 @@ struct req0_sock {
 	bool         closed;
 	bool         hasctx;
 	int          ttl;
-	nni_msg *    reqmsg;
 
 	req0_ctx sctx; // base socket ctx
 
@@ -192,9 +191,6 @@ req0_sock_fini(void *arg)
 	while ((!nni_list_empty(&s->readypipes)) ||
 	    (!nni_list_empty(&s->busypipes))) {
 		nni_cv_wait(&s->cv);
-	}
-	if (s->reqmsg != NULL) {
-		nni_msg_free(s->reqmsg);
 	}
 	nni_idhash_fini(s->ctxids);
 	nni_timer_fini(&s->sctx.timer);
@@ -495,6 +491,7 @@ req0_recv_cb(void *arg)
 	}
 
 	// We have our match, so we can remove this.
+	nni_list_node_remove(&ctx->sqnode);
 	nni_idhash_remove(sock->ctxids, id);
 	ctx->reqid = 0;
 	if (ctx->reqmsg != NULL) {
