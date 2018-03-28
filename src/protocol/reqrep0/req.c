@@ -144,6 +144,8 @@ req0_sock_init_impl(void **sp, nni_sock *sock, bool raw)
 			req0_sock_fini(s);
 			return (rv);
 		}
+		// Always sendable!
+		nni_pollable_raise(s->sctx.sendable);
 	}
 
 	s->raw = raw;
@@ -453,9 +455,7 @@ req0_recv_cb(void *arg)
 		goto malformed;
 	}
 
-	nni_mtx_lock(&sock->mtx);
 	if (sock->raw) {
-		nni_mtx_unlock(&sock->mtx);
 		nni_aio_set_msg(p->aio_putq, msg);
 		nni_msgq_aio_put(sock->urq, p->aio_putq);
 		return;
@@ -465,6 +465,8 @@ req0_recv_cb(void *arg)
 
 	// Schedule another receive while we are processing this.
 	nni_pipe_recv(p->pipe, p->aio_recv);
+
+	nni_mtx_lock(&sock->mtx);
 
 	// Look for a context to receive it.
 	if ((nni_idhash_find(sock->reqids, id, (void **) &ctx) != 0) ||
@@ -544,6 +546,7 @@ req0_ctx_init(void **cpp, void *sarg)
 
 	nni_mtx_lock(&sock->mtx);
 	ctx->sock  = sock;
+	ctx->aio   = NULL;
 	ctx->retry = sock->sctx.retry;
 	nni_mtx_unlock(&sock->mtx);
 

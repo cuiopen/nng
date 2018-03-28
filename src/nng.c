@@ -281,6 +281,64 @@ nng_ctx_send(nng_ctx cid, nng_aio *aio)
 	nni_ctx_rele(ctx);
 }
 
+static int
+nng_ctx_getx(nng_ctx id, const char *n, void *v, size_t *szp, int t)
+{
+	nni_ctx *ctx;
+	int      rv;
+
+	if ((rv = nni_init()) != 0) {
+		return (rv);
+	}
+	if ((rv = nni_ctx_find(&ctx, id, false)) != 0) {
+		return (rv);
+	}
+	rv = nni_ctx_getopt(ctx, n, v, szp, t);
+	nni_ctx_rele(ctx);
+	return (rv);
+}
+
+int
+nng_ctx_getopt(nng_ctx id, const char *name, void *val, size_t *szp)
+{
+	return (nng_ctx_getx(id, name, val, szp, NNI_TYPE_OPAQUE));
+}
+
+int
+nng_ctx_getopt_bool(nng_ctx id, const char *name, bool *vp)
+{
+	size_t sz = sizeof(*vp);
+	return (nng_ctx_getx(id, name, vp, &sz, NNI_TYPE_BOOL));
+}
+
+int
+nng_ctx_getopt_int(nng_ctx id, const char *name, int *vp)
+{
+	size_t sz = sizeof(*vp);
+	return (nng_ctx_getx(id, name, vp, &sz, NNI_TYPE_INT32));
+}
+
+int
+nng_ctx_getopt_size(nng_ctx id, const char *name, size_t *vp)
+{
+	size_t sz = sizeof(*vp);
+	return (nng_ctx_getx(id, name, vp, &sz, NNI_TYPE_SIZE));
+}
+
+int
+nng_ctx_getopt_string(nng_ctx id, const char *name, char **vp)
+{
+	size_t sz = sizeof(*vp);
+	return (nng_ctx_getx(id, name, vp, &sz, NNI_TYPE_STRING));
+}
+
+int
+nng_ctx_getopt_ms(nng_ctx id, const char *name, nng_duration *vp)
+{
+	size_t sz = sizeof(*vp);
+	return (nng_ctx_getx(id, name, vp, &sz, NNI_TYPE_DURATION));
+}
+
 int
 nng_dial(nng_socket sid, const char *addr, nng_dialer *dp, int flags)
 {

@@ -367,6 +367,10 @@ NNG_DECL void nng_ctx_send(nng_ctx, nng_aio *);
 // tunables (which does include NNG_OPT_SENDTIMEO and NNG_OPT_RECVTIMEO);
 // see the protocol documentation for more details.
 NNG_DECL int nng_ctx_getopt(nng_ctx, const char *, void *, size_t *);
+NNG_DECL int nng_ctx_getopt_bool(nng_ctx, const char *, bool *);
+NNG_DECL int nng_ctx_getopt_int(nng_ctx, const char *, int *);
+NNG_DECL int nng_ctx_getopt_ms(nng_ctx, const char *, nng_duration *);
+NNG_DECL int nng_ctx_getopt_size(nng_ctx, const char *, size_t *);
 
 // nng_ctx_setopt is used to set a context-specific option.  This
 // can only be used for those options that relate to specific context
