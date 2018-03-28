@@ -50,6 +50,8 @@ struct req0_ctx {
 	nni_timer_node timer;
 	nni_duration   retry;
 	bool           notify; // if true, send notifications
+	nni_pollable * recvable;
+	nni_pollable * sendable;
 };
 
 // A req0_sock is our per-socket protocol private structure.
@@ -61,7 +63,6 @@ struct req0_sock {
 	bool         raw;
 	bool         wantw;
 	bool         closed;
-	bool         hasctx;
 	int          ttl;
 
 	req0_ctx sctx; // base socket ctx
@@ -71,7 +72,7 @@ struct req0_sock {
 	nni_list ctxs;
 
 	nni_list    sendq;  // contexts waiting to send.
-	nni_idhash *ctxids; // contexts by request ID
+	nni_idhash *reqids; // contexts by request ID
 
 	uint32_t nextid;   // next id
 	uint8_t  reqid[4]; // outstanding request ID (big endian)
@@ -93,6 +94,7 @@ struct req0_pipe {
 	nni_mtx       mtx;
 };
 
+static void req0_sock_fini(void *);
 static void req0_getq_cb(void *);
 static void req0_sendraw_cb(void *);
 static void req0_sendcooked_cb(void *);
@@ -108,7 +110,7 @@ req0_sock_init_impl(void **sp, nni_sock *sock, bool raw)
 	if ((s = NNI_ALLOC_STRUCT(s)) == NULL) {
 		return (NNG_ENOMEM);
 	}
-	if ((rv = nni_idhash_init(&s->ctxids)) != 0) {
+	if ((rv = nni_idhash_init(&s->reqids)) != 0) {
 		NNI_FREE_STRUCT(s);
 		return (rv);
 	}
@@ -117,7 +119,7 @@ req0_sock_init_impl(void **sp, nni_sock *sock, bool raw)
 	// We start at a random point, to minimize likelihood of
 	// accidental collision across restarts.
 	nni_idhash_set_limits(
-	    s->ctxids, 0x80000000u, 0xffffffffu, nni_random() | 0x80000000u);
+	    s->reqids, 0x80000000u, 0xffffffffu, nni_random() | 0x80000000u);
 
 	nni_mtx_init(&s->mtx);
 	nni_cv_init(&s->cv, &s->mtx);
@@ -135,6 +137,14 @@ req0_sock_init_impl(void **sp, nni_sock *sock, bool raw)
 	s->sctx.notify = true;
 	s->sctx.retry  = NNI_SECOND * 60;
 	nni_list_append(&s->ctxs, &s->sctx);
+
+	if (!raw) {
+		if (((rv = nni_pollable_alloc(&s->sctx.sendable)) != 0) ||
+		    ((rv = nni_pollable_alloc(&s->sctx.recvable)) != 0)) {
+			req0_sock_fini(s);
+			return (rv);
+		}
+	}
 
 	s->raw = raw;
 	s->ttl = 8;
@@ -192,9 +202,13 @@ req0_sock_fini(void *arg)
 	    (!nni_list_empty(&s->busypipes))) {
 		nni_cv_wait(&s->cv);
 	}
-	nni_idhash_fini(s->ctxids);
+	nni_idhash_fini(s->reqids);
 	nni_timer_fini(&s->sctx.timer);
 	nni_mtx_unlock(&s->mtx);
+
+	nni_pollable_free(s->sctx.recvable);
+	nni_pollable_free(s->sctx.sendable);
+
 	nni_cv_fini(&s->cv);
 	nni_mtx_fini(&s->mtx);
 	NNI_FREE_STRUCT(s);
@@ -304,34 +318,6 @@ req0_pipe_stop(void *arg)
 		nni_timer_schedule(&ctx->timer, NNI_TIME_ZERO);
 	}
 	nni_mtx_unlock(&s->mtx);
-}
-
-static int
-req0_sock_setopt_maxttl(void *arg, const void *buf, size_t sz, int typ)
-{
-	req0_sock *s = arg;
-	return (nni_copyin_int(&s->ttl, buf, sz, 1, 255, typ));
-}
-
-static int
-req0_sock_getopt_maxttl(void *arg, void *buf, size_t *szp, int typ)
-{
-	req0_sock *s = arg;
-	return (nni_copyout_int(s->ttl, buf, szp, typ));
-}
-
-static int
-req0_sock_setopt_resendtime(void *arg, const void *buf, size_t sz, int typ)
-{
-	req0_sock *s = arg;
-	return (nni_copyin_ms(&s->sctx.retry, buf, sz, typ));
-}
-
-static int
-req0_sock_getopt_resendtime(void *arg, void *buf, size_t *szp, int typ)
-{
-	req0_sock *s = arg;
-	return (nni_copyout_ms(s->sctx.retry, buf, szp, typ));
 }
 
 // Raw and cooked mode differ in the way they send messages out.
@@ -481,7 +467,7 @@ req0_recv_cb(void *arg)
 	nni_pipe_recv(p->pipe, p->aio_recv);
 
 	// Look for a context to receive it.
-	if ((nni_idhash_find(sock->ctxids, id, (void **) &ctx) != 0) ||
+	if ((nni_idhash_find(sock->reqids, id, (void **) &ctx) != 0) ||
 	    (ctx->repmsg != NULL)) {
 		nni_mtx_unlock(&sock->mtx);
 		// No waiting context, or context already has a message.
@@ -492,7 +478,7 @@ req0_recv_cb(void *arg)
 
 	// We have our match, so we can remove this.
 	nni_list_node_remove(&ctx->sqnode);
-	nni_idhash_remove(sock->ctxids, id);
+	nni_idhash_remove(sock->reqids, id);
 	ctx->reqid = 0;
 	if (ctx->reqmsg != NULL) {
 		nni_msg_free(ctx->reqmsg);
@@ -507,9 +493,7 @@ req0_recv_cb(void *arg)
 	} else {
 		// No AIO, so stash msg.  Receive will pick it up later.
 		ctx->repmsg = msg;
-		if (ctx->notify) {
-			nni_sock_set_recvable(sock->nsock, true);
-		}
+		nni_pollable_raise(ctx->recvable);
 	}
 	nni_mtx_unlock(&sock->mtx);
 	return;
@@ -540,18 +524,27 @@ req0_ctx_init(void **cpp, void *sarg)
 {
 	req0_sock *sock = sarg;
 	req0_ctx * ctx;
+	int        rv;
 
 	if ((ctx = NNI_ALLOC_STRUCT(ctx)) == NULL) {
 		return (NNG_ENOMEM);
 	}
 
+	if (((rv = nni_pollable_alloc(&ctx->sendable)) != 0) ||
+	    ((rv = nni_pollable_alloc(&ctx->recvable)) != 0)) {
+		nni_pollable_free(ctx->sendable);
+		nni_pollable_free(ctx->recvable);
+		NNI_FREE_STRUCT(ctx);
+		return (rv);
+	}
+
+	// We can *always* send.
+	nni_pollable_raise(ctx->sendable);
 	nni_timer_init(&ctx->timer, req0_ctx_timeout, ctx);
 
 	nni_mtx_lock(&sock->mtx);
-	sock->hasctx = true;
-	ctx->sock    = sock;
-	ctx->retry   = sock->retry;
-	ctx->notify  = false;
+	ctx->sock  = sock;
+	ctx->retry = sock->sctx.retry;
 	nni_mtx_unlock(&sock->mtx);
 
 	*cpp = ctx;
@@ -571,6 +564,9 @@ req0_ctx_fini(void *arg)
 	nni_timer_cancel(&ctx->timer);
 	nni_timer_fini(&ctx->timer);
 
+	nni_pollable_free(ctx->recvable);
+	nni_pollable_free(ctx->sendable);
+
 	NNI_FREE_STRUCT(ctx);
 }
 
@@ -586,6 +582,33 @@ req0_ctx_getopt_resendtime(void *arg, void *buf, size_t *szp, int typ)
 {
 	req0_ctx *ctx = arg;
 	return (nni_copyout_ms(ctx->retry, buf, szp, typ));
+}
+
+static int
+req0_ctx_getopt_sendfd(void *arg, void *buf, size_t *szp, int typ)
+{
+	req0_ctx *ctx = arg;
+	int       rv;
+	int       fd;
+
+	if ((rv = nni_pollable_getfd(ctx->sendable, &fd)) != 0) {
+		return (rv);
+	}
+	return (nni_copyout_int(fd, buf, szp, typ));
+}
+
+static int
+req0_ctx_getopt_recvfd(void *arg, void *buf, size_t *szp, int typ)
+{
+	req0_ctx *ctx = arg;
+	int       rv;
+	int       fd;
+
+	if ((rv = nni_pollable_getfd(ctx->recvable, &fd)) != 0) {
+		return (rv);
+	}
+
+	return (nni_copyout_int(fd, buf, szp, typ));
 }
 
 static void
@@ -656,7 +679,7 @@ req0_ctx_reset(req0_ctx *ctx)
 	nni_list_node_remove(&ctx->pnode);
 	nni_list_node_remove(&ctx->sqnode);
 	if (ctx->reqid != 0) {
-		nni_idhash_remove(sock->ctxids, ctx->reqid);
+		nni_idhash_remove(sock->reqids, ctx->reqid);
 		ctx->reqid = 0;
 	}
 	if (ctx->reqmsg != NULL) {
@@ -719,9 +742,7 @@ req0_ctx_recv_locked(req0_ctx *ctx, nni_aio *aio)
 
 		nni_aio_set_msg(aio, msg);
 		nni_aio_finish(aio, 0, nni_msg_len(msg));
-		if (ctx->notify) {
-			nni_sock_set_recvable(ctx->sock->nsock, false);
-		}
+		nni_pollable_clear(ctx->recvable);
 	} else {
 		// No message yet, so post the wait.
 		ctx->aio = aio;
@@ -758,14 +779,14 @@ req0_ctx_send_locked(req0_ctx *ctx, nni_aio *aio)
 	req0_ctx_reset(ctx);
 
 	// Insert us on the per ID hash list, so that receives can find us.
-	if ((rv = nni_idhash_alloc(sock->ctxids, &id, ctx)) != 0) {
+	if ((rv = nni_idhash_alloc(sock->reqids, &id, ctx)) != 0) {
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
 	ctx->reqid  = (uint32_t) id;
 	ctx->reqmsg = msg;
 	if ((rv = nni_msg_header_append_u32(msg, ctx->reqid)) != 0) {
-		nni_idhash_remove(sock->ctxids, id);
+		nni_idhash_remove(sock->reqids, id);
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
@@ -777,12 +798,6 @@ req0_ctx_send_locked(req0_ctx *ctx, nni_aio *aio)
 	req0_run_sendq(sock);
 
 	nni_aio_finish(aio, 0, nni_msg_len(msg));
-
-	if (ctx->notify) {
-		// We are *always* sendable, because subsequent sends
-		// merely cancel prior sends.
-		nni_sock_set_sendable(sock->nsock, true);
-	}
 }
 
 static void
@@ -832,6 +847,48 @@ req0_sock_recv_raw(void *arg, nni_aio *aio)
 	nni_msgq_aio_get(s->urq, aio);
 }
 
+static int
+req0_sock_setopt_maxttl(void *arg, const void *buf, size_t sz, int typ)
+{
+	req0_sock *s = arg;
+	return (nni_copyin_int(&s->ttl, buf, sz, 1, 255, typ));
+}
+
+static int
+req0_sock_getopt_maxttl(void *arg, void *buf, size_t *szp, int typ)
+{
+	req0_sock *s = arg;
+	return (nni_copyout_int(s->ttl, buf, szp, typ));
+}
+
+static int
+req0_sock_setopt_resendtime(void *arg, const void *buf, size_t sz, int typ)
+{
+	req0_sock *s = arg;
+	return (req0_ctx_setopt_resendtime(&s->sctx, buf, sz, typ));
+}
+
+static int
+req0_sock_getopt_resendtime(void *arg, void *buf, size_t *szp, int typ)
+{
+	req0_sock *s = arg;
+	return (req0_ctx_getopt_resendtime(&s->sctx, buf, szp, typ));
+}
+
+static int
+req0_sock_getopt_recvfd(void *arg, void *buf, size_t *szp, int typ)
+{
+	req0_sock *s = arg;
+	return (req0_ctx_getopt_recvfd(&s->sctx, buf, szp, typ));
+}
+
+static int
+req0_sock_getopt_sendfd(void *arg, void *buf, size_t *szp, int typ)
+{
+	req0_sock *s = arg;
+	return (req0_ctx_getopt_sendfd(&s->sctx, buf, szp, typ));
+}
+
 static nni_proto_pipe_ops req0_pipe_ops = {
 	.pipe_init  = req0_pipe_init,
 	.pipe_fini  = req0_pipe_fini,
@@ -845,6 +902,18 @@ static nni_proto_ctx_option req0_ctx_options[] = {
 	    .co_type   = NNI_TYPE_DURATION,
 	    .co_getopt = req0_ctx_getopt_resendtime,
 	    .co_setopt = req0_ctx_setopt_resendtime,
+	},
+	{
+	    .co_name   = NNG_OPT_RECVFD,
+	    .co_type   = NNI_TYPE_INT32,
+	    .co_setopt = NULL,
+	    .co_getopt = req0_ctx_getopt_recvfd,
+	},
+	{
+	    .co_name   = NNG_OPT_SENDFD,
+	    .co_type   = NNI_TYPE_INT32,
+	    .co_setopt = NULL,
+	    .co_getopt = req0_ctx_getopt_sendfd,
 	},
 	{
 	    .co_name = NULL,
@@ -871,6 +940,31 @@ static nni_proto_sock_option req0_sock_options[] = {
 	    .pso_type   = NNI_TYPE_DURATION,
 	    .pso_getopt = req0_sock_getopt_resendtime,
 	    .pso_setopt = req0_sock_setopt_resendtime,
+	},
+	{
+	    .pso_name   = NNG_OPT_RECVFD,
+	    .pso_type   = NNI_TYPE_INT32,
+	    .pso_getopt = req0_sock_getopt_recvfd,
+	    .pso_setopt = NULL,
+	},
+	{
+	    .pso_name   = NNG_OPT_SENDFD,
+	    .pso_type   = NNI_TYPE_INT32,
+	    .pso_getopt = req0_sock_getopt_sendfd,
+	    .pso_setopt = NULL,
+	},
+	// terminate list
+	{
+	    .pso_name = NULL,
+	},
+};
+
+static nni_proto_sock_option req0_sock_options_raw[] = {
+	{
+	    .pso_name   = NNG_OPT_MAXTTL,
+	    .pso_type   = NNI_TYPE_INT32,
+	    .pso_getopt = req0_sock_getopt_maxttl,
+	    .pso_setopt = req0_sock_setopt_maxttl,
 	},
 	// terminate list
 	{
@@ -909,7 +1003,7 @@ static nni_proto_sock_ops req0_sock_ops_raw = {
 	.sock_fini    = req0_sock_fini,
 	.sock_open    = req0_sock_open,
 	.sock_close   = req0_sock_close,
-	.sock_options = req0_sock_options,
+	.sock_options = req0_sock_options_raw,
 	.sock_send    = req0_sock_send_raw,
 	.sock_recv    = req0_sock_recv_raw,
 };

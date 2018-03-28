@@ -118,6 +118,7 @@ void
 nni_sock_set_sendable(nni_sock *s, bool cansend)
 {
 	nni_notifyfd *fd = &s->s_send_fd;
+
 	if (fd->sn_init) {
 		if (cansend) {
 			nni_plat_pipe_raise(fd->sn_wfd);
@@ -131,6 +132,7 @@ void
 nni_sock_set_recvable(nni_sock *s, bool canrecv)
 {
 	nni_notifyfd *fd = &s->s_recv_fd;
+
 	if (fd->sn_init) {
 		if (canrecv) {
 			nni_plat_pipe_raise(fd->sn_wfd);
@@ -174,7 +176,15 @@ nni_sock_get_fd(nni_sock *s, int flag, int *fdp)
 			return (rv);
 		}
 
-		nni_msgq_set_cb(mq, cb, fd);
+		// Only set the callback on the message queue if we are
+		// using it.  The message queue automatically updates
+		// the pipe when the callback is first established.
+		// If we are not using the message queue, then we have
+		// to update the initial state explicitly ourselves.
+
+		if ((nni_sock_flags(s) & NNI_PROTO_FLAG_NOMSGQ) == 0) {
+			nni_msgq_set_cb(mq, cb, fd);
+		}
 
 		fd->sn_init = 1;
 	}
