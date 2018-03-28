@@ -27,7 +27,7 @@ struct nni_ctx {
 	void *            c_data;
 	bool              c_closed;
 	unsigned          c_refcnt; // protected by global lock
-	uint64_t          c_id;
+	uint32_t          c_id;
 	nng_aio *         c_linger_aio;
 	nng_duration      c_sndtimeo;
 	nng_duration      c_rcvtimeo;
@@ -1249,6 +1249,7 @@ nni_ctx_open(nni_ctx **ctxp, nni_sock *sock)
 {
 	nni_ctx *ctx;
 	int      rv;
+	uint64_t id;
 
 	if (sock->s_ctx_ops.ctx_init == NULL) {
 		return (NNG_ENOTSUP);
@@ -1268,12 +1269,13 @@ nni_ctx_open(nni_ctx **ctxp, nni_sock *sock)
 		NNI_FREE_STRUCT(ctx);
 		return (NNG_ECLOSED);
 	}
-	if ((rv = nni_idhash_alloc(nni_ctx_hash, &ctx->c_id, ctx)) != 0) {
+	if ((rv = nni_idhash_alloc(nni_ctx_hash, &id, ctx)) != 0) {
 		nni_mtx_unlock(&nni_sock_lk);
 		nni_aio_fini(ctx->c_linger_aio);
 		NNI_FREE_STRUCT(ctx);
 		return (rv);
 	}
+	ctx->c_id = (uint32_t) id;
 
 	if ((rv = sock->s_ctx_ops.ctx_init(&ctx->c_data, sock->s_data)) != 0) {
 		nni_idhash_remove(nni_ctx_hash, ctx->c_id);
