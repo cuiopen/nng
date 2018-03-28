@@ -210,7 +210,7 @@ nni_sock_getopt_recvfd(nni_sock *s, void *buf, size_t *szp, int typ)
 static int
 nni_sock_getopt_raw(nni_sock *s, void *buf, size_t *szp, int typ)
 {
-	bool raw = nni_sock_flags(s) & NNI_PROTO_FLAG_RAW ? true : false;
+	bool raw = (nni_sock_flags(s) & NNI_PROTO_FLAG_RAW) ? true : false;
 	return (nni_copyout_bool(raw, buf, szp, typ));
 }
 

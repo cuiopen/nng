@@ -75,7 +75,6 @@ TestMain("REQ concurrent contexts", {
 
 	Convey("We can use REQ contexts concurrently", {
 		nng_socket req;
-		nng_socket rep;
 
 		So(nng_aio_alloc(&rep_state.aio, (void *) rep_cb, NULL) == 0);
 		So(nng_rep_open(&rep_state.s) == 0);
@@ -104,12 +103,12 @@ TestMain("REQ concurrent contexts", {
 			for (i = 0; i < NCTX; i++) {
 				nng_ctx_close(ctxs[i]);
 			}
-			nng_close(rep);
 			nng_close(req);
+			nng_close(rep_state.s);
 			nng_aio_free(rep_state.aio);
 		});
 
-		So(nng_listen(rep, addr, NULL, 0) == 0);
+		So(nng_listen(rep_state.s, addr, NULL, 0) == 0);
 		So(nng_dial(req, addr, NULL, 0) == 0);
 
 		// Start the rep state machine going.
