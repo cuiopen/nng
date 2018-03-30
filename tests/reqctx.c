@@ -105,7 +105,12 @@ rep_cb(void)
 	}
 }
 
+// We can get by with 1000 (or more), except that the REP
+// socket can wind up force feeding the data back at us faster
+// than the pipe can consume, leading to dropped messages.
+// See bug #314 -- when that is fixed we can change this to 1000.
 #define NCTX 1000
+//#define NCTX 5
 
 TestMain("REQ concurrent contexts", {
 	int         rv;
@@ -131,6 +136,8 @@ TestMain("REQ concurrent contexts", {
 			}
 			nng_aio_set_timeout(aios[i], 5000);
 		}
+
+		So(nng_setopt_int(rep_state.s, NNG_OPT_SENDBUF, NCTX) == 0);
 		So(i == NCTX);
 		for (i = 0; i < NCTX; i++) {
 			uint32_t tmp;

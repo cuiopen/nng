@@ -464,9 +464,8 @@ req0_recv_cb(void *arg)
 	// Cooked mode.
 
 	// Schedule another receive while we are processing this.
-	nni_pipe_recv(p->pipe, p->aio_recv);
-
 	nni_mtx_lock(&sock->mtx);
+	nni_pipe_recv(p->pipe, p->aio_recv);
 
 	// Look for a context to receive it.
 	if ((nni_idhash_find(sock->reqids, id, (void **) &ctx) != 0) ||

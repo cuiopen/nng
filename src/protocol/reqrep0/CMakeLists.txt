@@ -16,7 +16,8 @@ if (NNG_PROTO_REQ0)
 endif()
 
 if (NNG_PROTO_REP0)
-    set(REP0_SOURCES protocol/reqrep0/rep.c protocol/reqrep0/rep.h)
+    set(REP0_SOURCES protocol/reqrep0/rep.c protocol/reqrep0/xrep.c
+    protocol/reqrep0/rep.h)
     set(REP0_HEADERS protocol/reqrep0/rep.h)
 endif()
 
