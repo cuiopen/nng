@@ -768,6 +768,7 @@ req0_ctx_send_locked(req0_ctx *ctx, nni_aio *aio)
 	req0_sock *sock = ctx->sock;
 	nng_msg *  msg  = nni_aio_get_msg(aio);
 	uint64_t   id;
+	size_t     len;
 	int        rv;
 
 	// Sending a new requst cancels the old one, including any
@@ -787,6 +788,7 @@ req0_ctx_send_locked(req0_ctx *ctx, nni_aio *aio)
 	}
 	ctx->reqid  = (uint32_t) id;
 	ctx->reqmsg = msg;
+	len         = nni_msg_len(msg);
 	if ((rv = nni_msg_header_append_u32(msg, ctx->reqid)) != 0) {
 		nni_idhash_remove(sock->reqids, id);
 		nni_aio_finish_error(aio, rv);
@@ -799,7 +801,7 @@ req0_ctx_send_locked(req0_ctx *ctx, nni_aio *aio)
 	// We are adding to the sendq, so run it.
 	req0_run_sendq(sock);
 
-	nni_aio_finish(aio, 0, nni_msg_len(msg));
+	nni_aio_finish(aio, 0, len);
 }
 
 static void
