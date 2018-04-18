@@ -485,11 +485,11 @@ rep0_ctx_recv(void *arg, nni_aio *aio)
 	memcpy(ctx->btrace, nni_msg_header(msg), len);
 	ctx->btrace_len = len;
 	ctx->pipe_id    = nni_pipe_id(p->pipe);
-	nni_mtx_unlock(&s->lk);
 
 	nni_msg_header_clear(msg);
 	nni_aio_set_msg(aio, msg);
 	nni_aio_finish(aio, 0, nni_msg_len(msg));
+	nni_mtx_unlock(&s->lk);
 }
 
 static void
@@ -501,43 +501,52 @@ rep0_pipe_recv_cb(void *arg)
 	nni_msg *  msg;
 	int        rv;
 	uint8_t *  body;
-	nni_aio *  aio;
+	nni_aio *  uaio; // user aio (virt)
+	nni_aio *  paio; // pipe aio (phys)
 	size_t     len;
 	int        hops;
 
-	if (nni_aio_result(p->aio_recv) != 0) {
+	paio = p->aio_recv;
+
+	nni_mtx_lock(&s->lk);
+	if (nni_aio_result(paio) != 0) {
+		nni_mtx_unlock(&s->lk);
 		nni_pipe_stop(p->pipe);
 		return;
 	}
 
-	msg = nni_aio_get_msg(p->aio_recv);
-
+	msg = nni_aio_get_msg(paio);
 	nni_msg_set_pipe(msg, p->id);
 
 	// Move backtrace from body to header
 	hops = 1;
 	for (;;) {
-		int end = 0;
+		bool end;
+
+		if (nni_msg_len(msg) < 4) {
+			// Peer is speaking garbage. Kick it.
+			nni_mtx_unlock(&s->lk);
+			nni_msg_free(msg);
+			nni_pipe_stop(p->pipe);
+			return;
+		}
 
 		if (hops > s->ttl) {
 			// This isn't malformed, but it has gone through
 			// too many hops.  Do not disconnect, because we
 			// can legitimately receive messages with too many
 			// hops from devices, etc.
+			nni_mtx_unlock(&s->lk);
 			goto drop;
 		}
 		hops++;
-		if (nni_msg_len(msg) < 4) {
-			// Peer is speaking garbage. Kick it.
-			nni_msg_free(msg);
-			nni_pipe_stop(p->pipe);
-			return;
-		}
+
 		body = nni_msg_body(msg);
-		end  = (body[0] & 0x80) ? 1 : 0;
-		rv   = nni_msg_header_append(msg, body, 4);
-		if (rv != 0) {
+		end  = ((body[0] & 0x80) != 0);
+
+		if ((rv = nni_msg_header_append(msg, body, 4)) != 0) {
 			// Out of memory, so drop it.
+			nni_mtx_unlock(&s->lk);
 			goto drop;
 		}
 		nni_msg_trim(msg, 4);
@@ -545,10 +554,6 @@ rep0_pipe_recv_cb(void *arg)
 			break;
 		}
 	}
-
-	len = nni_msg_header_len(msg);
-
-	nni_mtx_lock(&s->lk);
 
 	if ((ctx = nni_list_first(&s->recvq)) == NULL) {
 		// No one waiting to receive yet, holding pattern.
@@ -559,14 +564,15 @@ rep0_pipe_recv_cb(void *arg)
 	}
 
 	nni_list_remove(&s->recvq, ctx);
-	aio       = ctx->raio;
+	uaio      = ctx->raio;
 	ctx->raio = NULL;
-	nni_aio_set_msg(aio, msg);
-	nni_aio_set_msg(p->aio_recv, NULL);
+	nni_aio_set_msg(uaio, msg);
+	nni_aio_set_msg(paio, NULL);
 
 	// schedule another receive
-	nni_pipe_recv(p->pipe, p->aio_recv);
+	nni_pipe_recv(p->pipe, paio);
 
+	len             = nni_msg_header_len(msg);
 	ctx->btrace_len = len;
 	memcpy(ctx->btrace, nni_msg_header(msg), len);
 	nni_msg_header_clear(msg);
@@ -581,7 +587,7 @@ rep0_pipe_recv_cb(void *arg)
 
 	nni_mtx_unlock(&s->lk);
 
-	nni_aio_finish_synch(aio, 0, nni_msg_len(msg));
+	nni_aio_finish_synch(uaio, 0, nni_msg_len(msg));
 	return;
 
 drop:
