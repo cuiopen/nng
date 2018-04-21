@@ -16,7 +16,8 @@ if (NNG_PROTO_SURVEYOR0)
 endif()
 
 if (NNG_PROTO_RESPONDENT0)
-    set(RESP0_SOURCES protocol/survey0/respond.c protocol/survey0/respond.h)
+    set(RESP0_SOURCES protocol/survey0/respond.c protocol/survey0/xrespond.c
+    protocol/survey0/respond.h)
     set(RESP0_HEADERS protocol/survey0/respond.h)
 endif()
 
